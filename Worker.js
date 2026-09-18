@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f14";
+const CODE_STAMP = "2026-09-19-f15";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -2606,9 +2606,26 @@ class Store {
         const res=await this.db.prepare(
           "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING"
         ).bind(k, tok, Date.now()+(Number(ttlSec)||600)*1000).run();
-        const changed=(res&&res.meta&&typeof res.meta.changes==="number")
+        let changed=(res&&res.meta&&typeof res.meta.changes==="number")
           ? res.meta.changes
           : (res&&typeof res.changes==="number" ? res.changes : null);
+        // 🔴 f15 (گزارش HIGH — reclaim منقضی): برخلاف acquireLock، رکورد
+        //    منقضیِ claim قبل از INSERT حذف نمی‌شد ⇒ conflict روی ردیفِ
+        //    مرده → «seen» ابدی ( Worker بعد از گرفتن claim کرش کند،
+        //    تا ۶۰۰ ثانیه همه «seen» می‌گرفتند و هیچ cleanup عام هم نیست).
+        //    حالا همان الگوی acquireLock: اول منقضی را پاک کن، بعد دوباره درج.
+        if(changed===0){
+          try{
+            await this.db.prepare("DELETE FROM store WHERE key=? AND expires_at IS NOT NULL AND expires_at<=?")
+              .bind(k, Date.now()).run();
+          }catch{}
+          const res2=await this.db.prepare(
+            "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING"
+          ).bind(k, tok, Date.now()+(Number(ttlSec)||600)*1000).run();
+          changed=(res2&&res2.meta&&typeof res2.meta.changes==="number")
+            ? res2.meta.changes
+            : (res2&&typeof res2.changes==="number" ? res2.changes : null);
+        }
         if(changed!=null) return changed>0 ? {s:"claimed",t:tok} : {s:"seen"};
         const row=await this.db.prepare("SELECT value FROM store WHERE key=?").bind(k).first();
         // ⚠️ صرفِ وجود ردیف کافی نیست — فقط اگر مقدار token خودمان باشد مالِ ماست.
@@ -2719,9 +2736,22 @@ class Store {
         const res=await this.db.prepare(
           "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING"
         ).bind(k, tok, Date.now()+(Number(ttlSec)||900)*1000).run();
-        const changed=(res&&res.meta&&typeof res.meta.changes==="number")
+        let changed=(res&&res.meta&&typeof res.meta.changes==="number")
           ? res.meta.changes
           : (res&&typeof res.changes==="number" ? res.changes : null);
+        // 🔴 f15 (گزارش HIGH): reclaim رکورد منقضی — الگوی acquireLock (بالا).
+        if(changed===0){
+          try{
+            await this.db.prepare("DELETE FROM store WHERE key=? AND expires_at IS NOT NULL AND expires_at<=?")
+              .bind(k, Date.now()).run();
+          }catch{}
+          const res2=await this.db.prepare(
+            "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING"
+          ).bind(k, tok, Date.now()+(Number(ttlSec)||900)*1000).run();
+          changed=(res2&&res2.meta&&typeof res2.meta.changes==="number")
+            ? res2.meta.changes
+            : (res2&&typeof res2.changes==="number" ? res2.changes : null);
+        }
         if(changed!=null) return changed>0 ? {s:"claimed",t:tok} : {s:"seen"};
         const row=await this.db.prepare("SELECT value FROM store WHERE key=?").bind(k).first();
         return (row && String(row.value)===tok) ? {s:"claimed",t:tok} : {s:"seen"};
@@ -2771,14 +2801,20 @@ class Store {
    */
   async pushLog(entry) {
     try{
-      if(!this._logsCache){
-        this._logsCache=await this.getLogs();
-        this._logsCache=Array.isArray(this._logsCache)?this._logsCache:[];
-      }
-      this._logsCache.unshift({...entry, at: new Date().toISOString()});
-      if(this._logsCache.length>50) this._logsCache.length=50;
-      // کپی بگیر؛ اگر فراخوان بعدی آرایه را تغییر داد، نوشتنِ ما کامل باشد
-      await this.put(KEYS.LOGS, this._logsCache.slice());
+      // 🔴 f15 (گزارش MEDIUM — overwrite لاگ‌ها): دیگر روی کشِ ایزوله
+      //    نمی‌نویسیم؛ زیر قفل op_logs لیستِ تازه خوانده، ورودی اضافه و
+      //    ذخیره می‌شود ⇒ دو Worker همزمان لاگِ همدیگر را نمی‌سوزانند.
+      //    op_logs قفلِ «برگ» است (داخلش فقط get/put) ⇒ بن‌بست ندارد؛
+      //    قفل نیامد ⇒ همان یک ورودی می‌سوزد (لاگ best-effort است).
+      await this.withLock("op_logs", 8, async()=>{
+        const fresh=await this.get(KEYS.LOGS);
+        let list=[];
+        try{ list=fresh?(typeof fresh==="object"?fresh:JSON.parse(fresh)):[]; }catch{ list=[]; }
+        if(!Array.isArray(list)) list=[];
+        list.unshift({...entry, at:new Date().toISOString()});
+        if(list.length>50) list.length=50;
+        await this.put(KEYS.LOGS, list.slice());
+      }, 5000);
     }catch(e){ console.error("pushLog", e&&e.message); }
   }
   /**
@@ -2947,7 +2983,10 @@ class Store {
         return true;
       }catch(e){
         console.error("rateLimit d1", e&&e.message);
-        // قطعی D1 → لایهٔ محلی (fail-open: در دسترس‌بودن مقدم بر سخت‌گیری)
+        // قطعی D1 → لایهٔ محلی (fail-open: در دسترس‌بودن مقدم بر سخت‌گیری).
+        // 🔴 f15 یادداشت تصمیم (گزارش MEDIUM): fail-closed یعنی قطعی D1 کل
+        //    ربات را قطع می‌کند؛ اینجا آگاهانه fail-open می‌مانیم — سقف
+        //    per-isolate همچنان اعمال می‌شود و در حالت عادی مسیرِ سراسری است.
       }
     }
 
@@ -4849,6 +4888,23 @@ class Bot {
         if(!(await this.adminCan(uid,"clients"))){
           await this.tg.answer(cb.id,L(lang,"دسترسی ندارید","No access"),true);
           return;
+        }
+      }
+      // 🔴 f15 (گزارش HIGH — ACL عملیات Client): qe:*/eci:*/cen:* ویرایشِ
+      //    کلاینت‌اند (QuickEdit شامل تغییر ایمیل/حجم/انقضا/IP-limit) و
+      //    rci:* تمدید — قبلاً فقط محدودیتِ پنل را چک می‌کردند و feature
+      //    اصلاً بررسی نمی‌شد ⇒ ادمینِ محدودشده با callback جعلی می‌توانست
+      //    کلاینت ویرایش/تمدید کند.
+      if(d.startsWith("qe:")||d.startsWith("eci:")||d.startsWith("cen:")){
+        if(!(await this.adminCan(uid,"edit"))){
+          await this.tg.answer(cb.id,L(lang,"دسترسی ندارید","No access"),true);
+          return this.editOrSend(chat,mid,L(lang,"🚫 به «ویرایش کلاینت» دسترسی ندارید.\nOwner باید از «دسترسی پنل ادمین» اجازه بدهد.","🚫 No access to client editing.\nThe Owner must grant it from “Admin Panel Access”."), kb([[btn("◀","m:main")]]));
+        }
+      }
+      if(d.startsWith("rci:")){
+        if(!(await this.adminCan(uid,"renew"))){
+          await this.tg.answer(cb.id,L(lang,"دسترسی ندارید","No access"),true);
+          return this.editOrSend(chat,mid,L(lang,"🚫 به «تمدید کلاینت» دسترسی ندارید.\nOwner باید از «دسترسی پنل ادمین» اجازه بدهد.","🚫 No access to client renewal.\nThe Owner must grant it from “Admin Panel Access”."), kb([[btn("◀","m:main")]]));
         }
       }
       if(d.startsWith("sel_create:")||d.startsWith("u:plan:")){
@@ -9940,7 +9996,11 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       console.error("reconcile skipped: no public clients seen on any panel");
       return 0;
     }
-    let cleared=0;
+    // 🔴 f15 (گزارش HIGH — saveBotUsers مستقیم خارج از قفل): تصمیم‌ها اول
+    //    با اسنپ‌شاتِ ایمیل جمع می‌شوند، بعد فقط همان رکوردها زیر
+    //    withBotUsers اعمال می‌شوند — اگر ساخت/ویرایش همزمانِ دیگری ایمیل
+    //    رکورد را عوض کرده باشد، پاک‌سازیِ ما رد می‌شود (دور بعد دوباره چک).
+    const toClear=new Map();
     for(const id of Object.keys(users)){
       const u=users[id];
       if(!u||!u.email) continue;
@@ -9955,23 +10015,38 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       if(born>0 && (now-born)<RECONCILE_GRACE_MS){
         continue;
       }
-      users[id]={
-        ...u,
-        email:"",
-        panelId:null,
-        planId:null,
-        planName:"",
-        // تاریخچه قالب برای آمار حفظ می‌شود (planId پاک می‌شود ولی lastPlan* می‌ماند)
-        lastPlanId: u.planId != null ? String(u.planId) : (u.lastPlanId || null),
-        lastPlanName: u.planName || u.lastPlanName || "",
-        clearedAt:new Date().toISOString(),
-        clearReason:"reconcile_missing",
-      };
-      cleared++;
-      try{ await this.addLog("reconcile_clear", String(u.email||"")+" panel="+(u.panelId!=null?String(u.panelId):"-"), "reconcile"); }catch{}
+      toClear.set(id, {em:String(u.email), pid:(u.panelId!=null?String(u.panelId):"-")});
     }
-    if(cleared>0){
-      try{ await this.store.saveBotUsers(users); }catch(e){ console.error("reconcile save", e&&e.message); }
+    let cleared=0;
+    if(toClear.size){
+      const clearedIds=[];
+      try{
+        await this.store.withBotUsers((cur)=>{
+          for(const [id, dec] of toClear){
+            const c=cur[id];
+            if(!c || !c.email) continue;
+            if(String(c.email)!==dec.em) continue;   // همزمان عوض شده ⇒ رد
+            cur[id]={
+              ...c,
+              email:"",
+              panelId:null,
+              planId:null,
+              planName:"",
+              // تاریخچه قالب برای آمار حفظ می‌شود (planId پاک می‌شود ولی lastPlan* می‌ماند)
+              lastPlanId: c.planId != null ? String(c.planId) : (c.lastPlanId || null),
+              lastPlanName: c.planName || c.lastPlanName || "",
+              clearedAt:new Date().toISOString(),
+              clearReason:"reconcile_missing",
+            };
+            clearedIds.push(id);
+          }
+        });
+      }catch(e){ console.error("reconcile save", e&&e.message); return 0; }
+      cleared=clearedIds.length;
+      for(const id of clearedIds){
+        const dec=toClear.get(id);
+        try{ await this.addLog("reconcile_clear", dec.em+" panel="+dec.pid, "reconcile"); }catch{}
+      }
     }
     return cleared;
   }
@@ -14022,22 +14097,30 @@ if(active && active.reachable && active.client && !active.expired && !active.not
 
   async onRemoveAdmin(chat,mid,adminId) {
     const lang=await this.lang();
-    let admins=await this.store.getAdmins();
-    admins=admins.filter(a=>a!==adminId);
-    await this.store.saveAdmins(admins);
+    // 🔒 f15 (گزارش MEDIUM — RMW ادمین‌ها): خواندن و نوشتن زیر قفل
+    await this.store.withLock("admins", 10, async()=>{
+      const admins=await this.store.getAdmins();
+      await this.store.saveAdmins(admins.filter(a=>a!==adminId));
+    });
     await this.editOrSend(chat,mid,t(lang,"admin_removed"),(await this.backMain()));
   }
 
   async onAddAdminId(chat,uid,adminId) {
     const lang=await this.lang();
-    const admins=await this.store.getAdmins();
     if(!/^\d+$/.test(adminId)){await this.store.clearState(uid);return this.tg.msg(chat,"❌ Invalid ID");}
-    if(admins.includes(adminId)||(await this.ownerId())===adminId){
+    // 🔒 f15: خواندن-بررسی-افزودن همه زیر قفل (دو افزودن همزمان هر دو save شوند)
+    let added=false;
+    await this.store.withLock("admins", 10, async()=>{
+      const admins=await this.store.getAdmins();
+      if(admins.includes(adminId)||(await this.ownerId())===adminId) return;
+      admins.push(adminId);
+      await this.store.saveAdmins(admins);
+      added=true;
+    });
+    if(!added){
       await this.store.clearState(uid);
       return this.tg.msg(chat,"❌ Already admin");
     }
-    admins.push(adminId);
-    await this.store.saveAdmins(admins);
     await this.store.clearState(uid);
     await this.tg.msg(chat,t(lang,"admin_added")+" `"+adminId+"`",{reply_markup:(await this.backMain())});
   }
@@ -19745,6 +19828,7 @@ export default {
         const _chatQuoted=_chatInfo.title?(" «"+_chatInfo.title+"»"):"";
         const now=Date.now();
         let changed=false;
+        const toClearCron=new Map();   // 🔴 f15: تصمیم‌های پاک‌سازی (merge-at-save)
         for(const id of Object.keys(users)){
           const u=users[id];
           if(!u||!u.email||u.panelId==null) continue;
@@ -19835,12 +19919,7 @@ export default {
                 await store.put("pub:lastacct:"+String(id), JSON.stringify({email:_em5, exp:_expHint, at:Date.now(), reason: expired ? "expired" : "idle"}));
               }
             }catch{}
-            users[id]={
-              ...u,
-              email:"", panelId:null, planId:null, planName:"",
-              clearedAt:new Date().toISOString(),
-              clearReason: expired ? "expired" : "idle",
-            };
+            toClearCron.set(id, {em:String(u.email||""), reason: expired ? "expired" : "idle"});
             changed=true;
             try{
               if(tgInstance){
@@ -19878,7 +19957,21 @@ export default {
             }
           }
         }
-        if(changed) await store.saveBotUsers(users);
+        if(toClearCron.size){
+          // 🔴 f15 (گزارش HIGH): نوشتنِ bot_users دیگر مستقیم نیست — زیر
+          //    withBotUsers فقط رکوردهایی پاک می‌شوند که ایمیل‌شان هنوز همان
+          //    اسنپ‌شاتِ تصمیم است (ساخت همزمان رکورد نو را نمی‌سوزاند).
+          try{
+            await store.withBotUsers((cur)=>{
+              for(const [id2, dec2] of toClearCron){
+                const c=cur[id2];
+                if(!c || !c.email) continue;
+                if(String(c.email)!==dec2.em) continue;
+                cur[id2]={...c, email:"", panelId:null, planId:null, planName:"", clearedAt:new Date().toISOString(), clearReason:dec2.reason};
+              }
+            });
+          }catch(e){ console.error("cleanup save", e&&e.message); }
+        }
         await store.setCache("cleanup:pub_clients", true, 300); // every 5 min
         try{ await store.releaseLock("cleanup:pub_clients", cleanTok); }catch{}
         _cleanupTok=false;   // آزاد شد؛ catch دوباره تلاش نکند
