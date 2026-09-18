@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-13-f9";
+const CODE_STAMP = "2026-09-18-f10";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -2498,35 +2498,57 @@ class Store {
    *    globalThis.__updSeen فقط بهینه‌سازی است (کاهش D1)؛ درست بودنِ
    *    منطق فقط به این claim اتمیک وابسته است.
    */
+  /**
+   * f10: خروجی {s:"claimed"|"seen"|"error", t:token?}.
+   * 🔴 توکن مالکیت (گزارش امنیتی ۱۸ سپتامبر — High ۴): قبلاً مقدار claim
+   *    ثابتِ "claimed" بود و release کورکورانه DELETE WHERE key=? می‌زد؛
+   *    اگر claim بعد از انقضای TTL به پردازشگر B می‌رسید و A دیر release
+   *    می‌کرد، claimِ B پاک می‌شد و C دوباره همان آپدیت را می‌گرفت. حالا
+   *    همان الگوی releaseLock: مقدار = token یکتا، حذف فقط با تطبیق token.
+   */
   async claimUpdate(updateId, ttlSec) {
     const k="lock:proc:upd:"+String(updateId);
     if(this.db){
       try{
         await this.ready();
+        const tok=randId(20)+":"+Date.now();
         const res=await this.db.prepare(
           "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING"
-        ).bind(k, "claimed", Date.now()+(Number(ttlSec)||600)*1000).run();
+        ).bind(k, tok, Date.now()+(Number(ttlSec)||600)*1000).run();
         const changed=(res&&res.meta&&typeof res.meta.changes==="number")
           ? res.meta.changes
           : (res&&typeof res.changes==="number" ? res.changes : null);
-        if(changed!=null) return changed>0 ? "claimed" : "seen";
-        const row=await this.db.prepare("SELECT key FROM store WHERE key=?").bind(k).first();
-        return row ? "seen" : "claimed";
-      }catch(e){ console.error("claimUpdate d1", e&&e.message); return "error"; }
+        if(changed!=null) return changed>0 ? {s:"claimed",t:tok} : {s:"seen"};
+        const row=await this.db.prepare("SELECT value FROM store WHERE key=?").bind(k).first();
+        // ⚠️ صرفِ وجود ردیف کافی نیست — فقط اگر مقدار token خودمان باشد مالِ ماست.
+        return (row && String(row.value)===tok) ? {s:"claimed",t:tok} : {s:"seen"};
+      }catch(e){ console.error("claimUpdate d1", e&&e.message); return {s:"error"}; }
     }
     // بدون D1: حداقل حافظهٔ ایزوله — همان نقشهٔ __updSeen منبع حقیقت است
     if(!globalThis.__updSeen) globalThis.__updSeen=new Map();
     const uidKey="u"+String(updateId);
-    if(globalThis.__updSeen.has(uidKey)) return "seen";
+    if(globalThis.__updSeen.has(uidKey)) return {s:"seen"};
     globalThis.__updSeen.set(uidKey, Date.now());
-    return "claimed";
+    return {s:"claimed", t:null};
   }
-  /** f9: آزادسازی اتمیک claim خودمان (فقط اگر مالِ خودمان/been claimed باشیم) */
-  async releaseUpdateClaim(updateId) {
+  /**
+   * f10: آزادسازی claim — **فقط با توکن مالکیت** (الگوی releaseLock؛
+   * گزارش امنیتی ۱۸ سپتامبر — High ۴). حذفِ بدون توکن، claimِ پردازشگر
+   * جدیدتر را می‌شکست؛ حالا DELETE فقط وقتی اجرا می‌شود که value (token)
+   * هنوز همان token خودمان باشد.
+   */
+  async releaseUpdateClaim(updateId, token) {
     const k="lock:proc:upd:"+String(updateId);
     if(this.db){
-      try{ await this.db.prepare("DELETE FROM store WHERE key=?").bind(k).run(); return true; }
-      catch(e){ console.error("releaseUpdateClaim d1", e&&e.message); return false; }
+      try{
+        if(token){
+          await this.db.prepare("DELETE FROM store WHERE key=? AND value=?").bind(k, String(token)).run();
+        }else{
+          // مسیر legacy (claim بدون توکن — فقط حالت بدون D1)
+          await this.db.prepare("DELETE FROM store WHERE key=?").bind(k).run();
+        }
+        return true;
+      }catch(e){ console.error("releaseUpdateClaim d1", e&&e.message); return false; }
     }
     try{ globalThis.__updSeen && globalThis.__updSeen.delete("u"+String(updateId)); }catch{}
     return true;
@@ -2605,7 +2627,16 @@ class Store {
         return (row && String(row.value)===token) ? token : false;
       }catch(e){
         console.error("acquireLock d1", e&&e.message);
-        // در خطای D1 به قفل حافظه‌ای برگرد
+        // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — High): دیگر به قفل حافظه‌ای
+        //    سقوط نمی‌کنیم. globalThis بین ایزوله‌های Worker مشترک نیست؛
+        //    در قطعیِ D1 دو ایزوله هر دو «قفل موفق» می‌گرفتند و همان
+        //    lost-updateای که withBotUsers/ucreate/pubcap برای جلوگیری از
+        //    آن ساخته شده‌اند دوباره ممکن می‌شد. حالا fail-closed: false
+        //    برمی‌گردد — همهٔ صداکنندگان (withBotUsers، ucreate، resmap،
+        //    pubcap، cron، cf_deploy، install، xfer، urlrefresh) از قبل
+        //    مسیر «شلوغ است / رد شدن / 409» را هندل می‌کنند.
+        //    مسیر حافظه‌ای پایین فقط برای deployment بدون بایندینگ D1 است.
+        return false;
       }
     }
 
@@ -4566,6 +4597,10 @@ class Bot {
       if(!need && (d.startsWith("dci:")||d.startsWith("cdelete:"))) need="delete";
       if(!need && d.startsWith("bulk")) need="bulk";
       if(!need && d.startsWith("pm:")) need="panels";
+      // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — Critical ۲): فعال/غیرفعال‌سازی
+      //    پنل هم مجوز «panels» می‌خواهد؛ قبلاً sel_en:/sel_dis: کلاً از
+      //    ACL عبور می‌کردند.
+      if(!need && (d.startsWith("sel_en:")||d.startsWith("sel_dis:"))) need="panels";
       // 📦 قالب‌ها زیر «عمومی» یکپارچه شد، ولی مجوزش همان «plans» بماند
       //    وگرنه ادمینی که فقط دسترسی قالب دارد پشت در می‌ماند.
       if(!need && (d==="pub:plans" || d.startsWith("pub:plan:"))) need="plans";
@@ -4616,6 +4651,19 @@ class Bot {
       if(!(await this.isOwner(uid))){
         await this.tg.answer(cb.id, L(lang,"فقط Owner","Owner only"), true);
         return this.editOrSend(chat,mid,L(lang,"🔒 فقط *Owner* به توکن‌ها و تنظیمات حساس دسترسی دارد.","🔒 Only the *Owner* can access tokens and sensitive settings."), kb([[btn("◀","m:main")]]));
+      }
+    }
+    // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — Critical ۱): همهٔ callbackهای
+    //    «set:*» (تنظیمات سراسری: ادمین‌ها، زبان، rate limit، op-lock،
+    //    خوش‌آمد، summary، renew mode، امنیت/کلیدها، diag) و «adm_*»
+    //    (مدیریت/حذف ادمین) فقط Owner. قبلاً فقط «دکمه‌ها» برای Owner
+    //    رندر می‌شدند ولی خودِ callback بدون هیچ بررسی‌ای dispatch می‌شد —
+    //    یعنی ادمین محدودشده با callback جعلی می‌توانست ادمین حذف کند یا
+    //    تنظیمات سراسری (rate limit / welcome / lang / ...) را عوض کند.
+    if(d.startsWith("set:") || d.startsWith("adm_")){
+      if(!(await this.isOwner(uid))){
+        await this.tg.answer(cb.id, L(lang,"فقط Owner","Owner only"), true);
+        return this.editOrSend(chat,mid,L(lang,"🔒 فقط *Owner* به تنظیمات سراسری و مدیریت ادمین‌ها دسترسی دارد.","🔒 Only the *Owner* can access global settings and admin management."), kb([[btn("◀","m:main")]]));
       }
     }
 
@@ -16307,7 +16355,10 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
   async onEnablePickPanel(chat,mid,pid) {
     const lang=await this.lang();
-    const panels=await this.store.getPanels();
+    // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — Critical ۲): به‌جای getPanels() کامل،
+    //    فقط پنل‌های مجازِ همین ادمین (panelsForUser) — وگرنه callback جعلیِ
+    //    «sel_dis:all» تمام پنل‌های همهٔ ادمین‌ها را خاموش می‌کرد.
+    const panels=await this.panelsForUser(this._uid);
     if (pid === "all") {
       await this.editOrSend(chat,mid,L(lang,"⏳ در حال فعال‌سازی تمامی پنل‌ها و کاربران...","⏳ Enabling all panels and users..."),kb([]));
       for (const p of panels) {
@@ -16353,7 +16404,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
   async onDisablePickPanel(chat,mid,pid) {
     const lang=await this.lang();
-    const panels=await this.store.getPanels();
+    // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — Critical ۲): فقط پنل‌های مجاز همین ادمین.
+    const panels=await this.panelsForUser(this._uid);
     if (pid === "all") {
       await this.editOrSend(chat,mid,L(lang,"⏳ در حال غیرفعال‌سازی تمامی پنل‌ها و کاربران...","⏳ Disabling all panels and users..."),kb([]));
       for (const p of panels) {
@@ -17046,13 +17098,17 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       lang: L(lang,"🌐 زبان","🌐 Language"),
       add_admin: L(lang,"👮 ادمین‌ها","👮 Admins"),
     };
-    const rows=[
-      [btn(btnLabels.autobackup,"set:autobackup")],
-      [btn(btnLabels.ratelimit,"set:ratelimit"), btn(btnLabels.oplock,"set:oplock")],
-      [btn(btnLabels.renewmode,"set:renewmode")],
-      [btn(btnLabels.lang,"set:lang"), btn(btnLabels.add_admin,"set:admins")],
-    ];
-    if(isOwn) rows.push([btn(L(lang,"🔐 امنیت و کلیدها","🔐 Security & keys"),"set:security")]);
+    const rows=[];
+    // 🔴 f10: این دکمه‌ها تنظیماتِ سراسری‌اند و فقط Owner — قبلاً برای هر
+    //    ادمینِ دارای «settings» رندر می‌شدند (و callback هم بدون بررسی
+    //    اجرا می‌شد). حالا هم رندر گیت دارد هم dispatch (پایین‌تر در onCb).
+    if(isOwn){
+      rows.push([btn(btnLabels.autobackup,"set:autobackup")]);
+      rows.push([btn(btnLabels.ratelimit,"set:ratelimit"), btn(btnLabels.oplock,"set:oplock")]);
+      rows.push([btn(btnLabels.renewmode,"set:renewmode")]);
+      rows.push([btn(btnLabels.lang,"set:lang"), btn(btnLabels.add_admin,"set:admins")]);
+      rows.push([btn(L(lang,"🔐 امنیت و کلیدها","🔐 Security & keys"),"set:security")]);
+    }
     rows.push(navPair(lang, "m:main"));
     await this.editOrSend(chat,mid,lines.join("\n"), kb(rows));
   }
@@ -20548,7 +20604,7 @@ export default {
         //      تلگرام دوباره بفرستد (آپدیت هیچ‌وقت بی‌سرنوشت نمی‌ماند).
         //    «پردازش‌شده» فقط بعد از handleUpdateِ موفق ثبت می‌شود (پایین) —
         //    پس خطای وسط راه دیگر آپدیت را برای همیشه نمی‌بلعد.
-        let _updClaim=null;
+        let _updClaim=null; let _updClaimTok=null; // f10: توکن مالکیت claim
         try{
           if(update && update.update_id!=null){
             if(!globalThis.__updSeen) globalThis.__updSeen=new Map();
@@ -20561,12 +20617,18 @@ export default {
             }
             globalThis.__updSeen.set(uidKey, Date.now()); // بهینه‌سازی؛ منبع حقیقت = claim
             const _cl=await store.claimUpdate(update.update_id, 600);
-            if(_cl==="seen") return new Response("OK",{status:200});
-            if(_cl==="error"){
+            const _cs=_cl&&_cl.s;
+            if(_cs==="seen") return new Response("OK",{status:200});
+            if(_cs==="error"){
+              // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — High ۵): نشانگر حافظه هم
+              //    پاک شود وگرنه retry تلگرام به همین ایزوله می‌رسد، میان‌بر
+              //    __updSeen می‌گیرد، ۲۰۰ می‌بیند و آپدیت برای همیشه گم می‌شود.
+              try{ globalThis.__updSeen.delete(uidKey); }catch{}
               console.error("update claim failed → 503");
               return new Response("Temporarily unavailable",{status:503});
             }
             _updClaim=String(update.update_id);
+            _updClaimTok=(_cl&&_cl.t)||null;
           }
         }catch(e){ console.error("claim block", e&&e.message); }
         const bot=new Bot(store,token,ctx);
@@ -20587,9 +20649,11 @@ export default {
           return new Response("OK",{status:200});
         }
         await bot.handleUpdate(update);
-        // ✅ f9: آپدیت با موفقیت پردازش شد — حالا که کارِ واقعی تمام شده، claim
-        //    ۶۰۰ ثانیه‌ای به‌عنوان «پردازش‌شده» تمدید می‌شود تا retry تلگرامِ
-        //    دیرهنگام هم بدون پردازشِ دوباره ۲۰۰ بگیرد (پیام تکراری نمی‌رود).
+        // ✅ f9/f10: آپدیت با موفقیت پردازش شد — ردیف claim (TTL ۶۰۰ ثانیه)
+        //    بدون تمدیدِ اضافی همین‌جا می‌ماند و نقش «پردازش‌شده» دارد تا
+        //    retry تلگرامِ دیرهنگام بدون پردازشِ دوباره ۲۰۰ بگیرد (پیام
+        //    تکراری نمی‌رود). حذفِ این ردیف فقط در مسیر خطا و فقط با
+        //    توکن مالکیت انجام می‌شود (releaseUpdateClaim).
       }catch(e){
         // ⚠️ سیاست retry:
         // پیش‌فرض ۲۰۰ است چون آپدیت‌های ما idempotent نیستند — اگر
@@ -20644,7 +20708,14 @@ export default {
             const _triesKey="upd:tries:"+_updClaim;
             const _tries=(Number(await store.cache(_triesKey))||0)+1;
             if(_tries>=3){ _giveUp=true; await store.setCache(_triesKey, true, 600); }
-            else { await store.setCache(_triesKey, _tries, 600); await store.releaseUpdateClaim(_updClaim); }
+            else {
+              await store.setCache(_triesKey, _tries, 600);
+              await store.releaseUpdateClaim(_updClaim, _updClaimTok);
+              // 🔴 f10 (گزارش High ۵): نشانگر حافظهٔ ایزوله هم پاک شود وگرنه
+              //    retry تلگرام در همین ایزوله میان‌بر ۲۰۰ می‌گیرد و آپدیت
+              //    گم می‌شود. (در giveup، نشانگر عمداً می‌ماند = پردازش‌شده)
+              try{ if(globalThis.__updSeen) globalThis.__updSeen.delete("u"+String(_updClaim)); }catch{}
+            }
           }
         }catch{}
         try{ await store.pushLog({action:_giveUp?"webhook_gaveup":(retriable?"webhook_retry":"webhook_error_release"), detail:emsg.slice(0,200), by:"system", meta:null}); }catch{}
