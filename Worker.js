@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f15";
+const CODE_STAMP = "2026-09-19-f16";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -2635,7 +2635,12 @@ class Store {
     // بدون D1: حداقل حافظهٔ ایزوله — همان نقشهٔ __updSeen منبع حقیقت است
     if(!globalThis.__updSeen) globalThis.__updSeen=new Map();
     const uidKey="u"+String(updateId);
-    if(globalThis.__updSeen.has(uidKey)) return {s:"seen"};
+    // 🔴 f16 (گزارش MEDIUM — claim بدون TTL در fallback): ورودی قدیمی‌تر از
+    //    ttlSec یعنی claim منقضی ⇒ reclaim (مثل مسیر D1). شکلِ عددیِ مقدار
+    //    حفظ شده تا sweep وب‌هوک نشکند.
+    const _ttlMs=(Number(ttlSec)||600)*1000;
+    const _prev=Number(globalThis.__updSeen.get(uidKey))||0;
+    if(_prev && (Date.now()-_prev)<_ttlMs) return {s:"seen"};
     globalThis.__updSeen.set(uidKey, Date.now());
     return {s:"claimed", t:null};
   }
@@ -2649,12 +2654,9 @@ class Store {
     const k="lock:proc:upd:"+String(updateId);
     if(this.db){
       try{
-        if(token){
-          await this.db.prepare("DELETE FROM store WHERE key=? AND value=?").bind(k, String(token)).run();
-        }else{
-          // مسیر legacy (claim بدون توکن — فقط حالت بدون D1)
-          await this.db.prepare("DELETE FROM store WHERE key=?").bind(k).run();
-        }
+        // 🔴 f16: همان گارد releaseOp — حذفِ بدون مالکیت ممنوع
+        if(!token){ console.error("releaseUpdateClaim بدون توکن رد شد", k); return false; }
+        await this.db.prepare("DELETE FROM store WHERE key=? AND value=?").bind(k, String(token)).run();
         return true;
       }catch(e){ console.error("releaseUpdateClaim d1", e&&e.message); return false; }
     }
@@ -2772,11 +2774,10 @@ class Store {
     const k="lock:op:"+String(opKey);
     if(this.db){
       try{
-        if(token){
-          await this.db.prepare("DELETE FROM store WHERE key=? AND value=?").bind(k, String(token)).run();
-        }else{
-          await this.db.prepare("DELETE FROM store WHERE key=?").bind(k).run();
-        }
+        // 🔴 f16 (گزارش MEDIUM): حذفِ بدون توکن = شکستن claim دیگری — ممنوع.
+        //    همهٔ مسیرهای عادی توکن دارند؛ بدون توکن فقط رد می‌کنیم.
+        if(!token){ console.error("releaseOp بدون توکن رد شد", k); return false; }
+        await this.db.prepare("DELETE FROM store WHERE key=? AND value=?").bind(k, String(token)).run();
         return true;
       }catch(e){ console.error("releaseOp d1", e&&e.message); return false; }
     }
@@ -4451,15 +4452,31 @@ class Bot {
   async withOpLock(lockKey, uid, fn) {
     const lang=await this.lang();
     const s=await this.getSettings();
-    const sec=s.opLockSec!=null?s.opLockSec:20;
+    const sec=Math.max(5, s.opLockSec!=null?s.opLockSec:20);
     const lockTok=await this.store.acquireLock(lockKey, sec);
     if(!lockTok){
       const err=new Error(L(lang,"عملیات همزمان روی این مورد در جریان است. چند ثانیه بعد دوباره تلاش کنید.","Another operation is already running on this item. Try again in a few seconds."));
       err.code="LOCKED";
       throw err;
     }
-    try{ return await fn(); }
-    finally{ try{ await this.store.releaseLock(lockKey, lockTok); }catch{} }
+    // 💓 f16 (گزارش HIGH — withOpLock بدون heartbeat): bulk چندین client را
+    //    batch‌به‌batch پردازش می‌کند و روی پنل کند از TTL عبور می‌کرد ⇒ قفل
+    //    زیر پای fn می‌گذشت و اجرای دوم همان bulk همزمان شروع می‌شد. حالا
+    //    هر ثلث TTL تمدید می‌شود (renewLock مالکیت‌محور) و اولین شکستِ تمدید
+    //    lease.lost=true می‌گذارد — fn می‌تواند قبل از هر نوشتن چک کند.
+    const lease={lost:false, key:String(lockKey), token:lockTok};
+    const _iv=setInterval(()=>{
+      try{
+        Promise.resolve(this.store.renewLock(lease.key, lease.token, sec))
+          .then((ok)=>{ if(!ok){ lease.lost=true; try{clearInterval(_iv);}catch{} } })
+          .catch(()=>{ lease.lost=true; try{clearInterval(_iv);}catch{} });
+      }catch{ lease.lost=true; try{clearInterval(_iv);}catch{} }
+    }, Math.max(2000, Math.floor(sec*1000/3)));
+    try{ return await fn(lease); }
+    finally{
+      try{ clearInterval(_iv); }catch{}
+      try{ await this.store.releaseLock(lease.key, lease.token); }catch{}
+    }
   }
 
 
