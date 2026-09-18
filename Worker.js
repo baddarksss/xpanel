@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f12";
+const CODE_STAMP = "2026-09-19-f13";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -2242,10 +2242,16 @@ class Store {
         let failed=0;
         for(const k of keys){
           try{
-            const cur=await this._d1GetRaw(k);
-            if(cur!=null) continue; // D1 خودش مقدار (تازه‌تر) دارد — بازنویسی ممنوع
             const v = await this.kv.get(k, {type:"text"});
-            if(v!=null && v!=="") await this._d1PutRaw(k, v, null);
+            if(v!=null && v!==""){
+              // 🔴 f13 (گزارش — race مهاجرت): دیگر SELECT→INSERT نیست؛
+              //   INSERT … ON CONFLICT DO NOTHING اتمیک است — اگر Worker
+              //   دیگری همین حالا مقدار تازه‌ای نوشته باشد، درجِ ما no-op
+              //   می‌شود و هرگز overwrite نمی‌کند.
+              await this.db.prepare(
+                "INSERT INTO store (key,value,expires_at) VALUES (?,?,NULL) ON CONFLICT(key) DO NOTHING"
+              ).bind(k, v).run();
+            }
           }catch(e){ failed++; console.error("migrate key", k, (e&&e.message)||e); }
         }
         if(!failed){
@@ -2308,9 +2314,20 @@ class Store {
     ).bind(k, val, exp).run();
   }
 
-  async _d1DelRaw(k) {
+  async _d1DelRaw(k, strict) {
     if(!this.db) return;
-    try{ await this.db.prepare("DELETE FROM store WHERE key=?").bind(k).run(); }catch{}
+    try{
+      await this.db.prepare("DELETE FROM store WHERE key=?").bind(k).run();
+    }catch(e){
+      console.error("D1 del", k, e&&e.message);
+      if(strict===true){
+        // 🔴 f13 (گزارش HIGH): D1 منبع حقیقت است — «نتوانستم حذف کنم»
+        //     نباید بی‌صدا بلعیده شود. strict=true ⇒ خطا بالا می‌آید
+        //     (برای حذف‌های امنیتی: ابطال توکن، DEPLOY_PENDING و ...).
+        const err=new Error("D1_ERROR: delete failed for "+k+": "+((e&&e.message)||e));
+        err.cause=e; throw err;
+      }
+    }
   }
 
   /**
@@ -2389,9 +2406,9 @@ class Store {
     }
   }
 
-  async del(k) {
+  async del(k, strict) {
     await this.ready();
-    if(this.db) await this._d1DelRaw(k);
+    if(this.db) await this._d1DelRaw(k, strict===true);
     if(this.kv){ try{ await this.kv.delete(k); }catch{} }
   }
 
@@ -2451,13 +2468,25 @@ class Store {
     await this.put(KEYS.DIAG_TOKEN, rec);
     return rec;
   }
-  async revokeDiagToken() { try{ await this.del(KEYS.DIAG_TOKEN); }catch{} }
+  async revokeDiagToken() {
+    // 🔴 f13: strict — اگر حذف شکست بخورد، توکن زنده می‌ماند و UI نباید
+    //    «ابطال شد» دروغ بگوید؛ خطا بالا می‌رود (fail-closed).
+    await this.del(KEYS.DIAG_TOKEN, true);
+  }
   /** شمارش استفاده؛ از سقف که رد شد خودش را باطل می‌کند (توکن نامحدود: بدون سقف) */
   async bumpDiagToken(rec) {
-    const next = { ...rec, hits: (Number(rec.hits)||0)+1, lastUsed: Date.now() };
-    if(!next.unlimited && next.hits > DIAG_MAX_HITS){ await this.revokeDiagToken(); return null; }
-    try{ await this.put(KEYS.DIAG_TOKEN, next); }catch{}
-    return next;
+    // 🔴 f13 (گزارش MEDIUM — counter غیراتمیک): خواندن+افزایش+نوشتن زیر
+    //    قفل diag_token — دو درخواست همزمان دیگر hits را گم نمی‌کنند و
+    //    DIAG_MAX_HITS قابل دورزدن با درخواست‌های موازی نیست.
+    return this.withLock("diag_token", 10, async()=>{
+      const cur=await this.getDiagToken();
+      if(!cur) return null;                                   // بینِ چک و bump منقضی/ابطال شده
+      if(rec && String(cur.token)!==String(rec.token)) return null; // توکن عوض شده ⇒ rec باطل
+      const next={ ...cur, hits:(Number(cur.hits)||0)+1, lastUsed: Date.now() };
+      if(!next.unlimited && next.hits > DIAG_MAX_HITS){ await this.del(KEYS.DIAG_TOKEN, true); return null; }
+      await this.put(KEYS.DIAG_TOKEN, next);
+      return next;
+    });
   }
 
   async getAdminKey() {
@@ -2469,8 +2498,32 @@ class Store {
   }
   async getPanels() { const r=await this.get(KEYS.PANELS); if(!r) return []; try{ const v=typeof r==="object"?r:JSON.parse(r); return Array.isArray(v)?v:[]; }catch{ return []; } }
   async savePanels(p) { await this.put(KEYS.PANELS,p); }
-  async getSettings() { const r=await this.get(KEYS.SETTINGS); if(!r) return {...DEFAULT_SETTINGS}; try{ return {...DEFAULT_SETTINGS, ...(typeof r==="object"?r:JSON.parse(r))}; }catch{ return {...DEFAULT_SETTINGS}; } }
-  async saveSettings(s) { await this.put(KEYS.SETTINGS,s); }
+  async getSettings() {
+    const r=await this.get(KEYS.SETTINGS);
+    if(!r) return {...DEFAULT_SETTINGS, _cfgRev:0};
+    try{
+      const s={...DEFAULT_SETTINGS, ...(typeof r==="object"?r:JSON.parse(r))};
+      if(s._cfgRev==null) s._cfgRev=0;   // 🔴 f13: نسخه برای ذخیرهٔ اتمیک
+      return s;
+    }catch{ return {...DEFAULT_SETTINGS, _cfgRev:0}; }
+  }
+  async saveSettings(s) {
+    // 🔴 f13: همان optimistic concurrency قیمت publicCfg — دو تغییر همزمان
+    //    تنظیمات دیگر هرکدام overwriteِ بی‌صدا نمی‌شوند؛ دومی خطا می‌گیرد.
+    await this.withLock("settings", 10, async()=>{
+      const r=await this.get(KEYS.SETTINGS);
+      let cur=null; try{ cur=r?(typeof r==="object"?r:JSON.parse(r)):null; }catch{ cur=null; }
+      const curRev=(cur&&Number(cur._cfgRev))||0;
+      const myRev=(s&&Number(s._cfgRev))||0;
+      if(myRev!==curRev){
+        const err=new Error("SETTINGS_CONFLICT: تنظیمات همزمان تغییر کرده؛ دوباره تلاش کنید.");
+        err.code="CFG_CONFLICT";
+        throw err;
+      }
+      s._cfgRev=curRev+1;
+      await this.put(KEYS.SETTINGS, s);
+    });
+  }
   async getState(uid) { const r=await this.get("s:"+uid); if(!r) return null; try{ return typeof r==="object"?r:JSON.parse(r); }catch{ return null; } }
   async setState(uid,flow,data) {
     try{ await this.put("s:"+uid,{flow,data:data||{}},600); }
@@ -2605,20 +2658,29 @@ class Store {
       err.code="LOCKED";
       throw err;
     }
-    // 💓 f12 (گزارش HIGH — withLock بدون تمدید): بخش بحرانی ممکن است از TTL
-    //    طولانی‌تر شود و قفل زیر پای fn بگذرد. هر ثلث TTL تمدید می‌کنیم؛ اگر
-    //    تمدید شکست بخورد (قطعی D1 یا قفلِ ربوده‌شده) دیگر تمدید نمی‌شود و
-    //    پنجرهٔ ریسک = مدت قطعی — همان حالت degraded که همه‌جا پذیرفته شده.
-    //    البته قاعدهٔ اصلی این است که داخل بخش بحرانی شبکه نباشد (پایین:
-    //    prune صف سه‌فازی شد).
+    // 💓 f12+f13 (گزارش HIGH — heartbeat باید fail-safe باشد): هر ثلث TTL
+    //    تمدید می‌کنیم و نتیجه روی « lease » منعکس می‌شود: اولین تمدیدِ
+    //    ناموفق ⇒ lease.lost=true و توقف تمدید. fn این فلگ را به‌عنوان
+    //    آرگومان اول می‌گیرد و «قبل از هر نوشتنِ مهم» می‌تواند چک کند
+    //    (پایین: فاز نوشتنِ صف صف‌چک می‌شود). قاعدهٔ اصلی همچنان این است
+    //    که بخش بحرانی شبکه نداشته باشد — اینجا همهٔ بخش‌ها فقط-D1 و
+    //    میلی‌ثانیه‌ای‌اند؛ پنجرهٔ ریسک = قطعیِ D1 حین fn که در آن صورت
+    //    خودِ نوشتن هم شکست می‌خورد.
+    const lease={lost:false, key:String(key), token:held};
     const _ttl=Math.max(5,Number(ttlSec)||20);
     const _iv=setInterval(()=>{
-      try{ this.renewLock(String(key), held, _ttl).catch(()=>{}); }catch{}
+      try{
+        Promise.resolve(this.renewLock(lease.key, lease.token, _ttl))
+          .then((ok)=>{ if(!ok){ lease.lost=true; try{clearInterval(_iv);}catch{} } })
+          .catch(()=>{ lease.lost=true; try{clearInterval(_iv);}catch{} });
+      }catch{ lease.lost=true; try{clearInterval(_iv);}catch{} }
     }, Math.max(2000, Math.floor(_ttl*1000/3)));
-    try{ return await fn(); }
+    try{ return await fn(lease); }
     finally{
       try{ clearInterval(_iv); }catch{}
-      try{ await this.releaseLock(String(key), held); }catch{}
+      // release همیشه تلاش می‌شود — خودش token-guarded است و اگر قفل
+      // رفته باشد بی‌اثر است.
+      try{ await this.releaseLock(lease.key, lease.token); }catch{}
     }
   }
   /**
@@ -2827,25 +2889,21 @@ class Store {
     const win=Math.floor(now/60000);           // شمارهٔ پنجرهٔ یک‌دقیقه‌ای
     const memKey=String(uid)+"@"+win;
 
-    // لایهٔ ۱ — حافظهٔ ایزوله (سقف نرم = سقف واقعی؛ رد شدن از آن یعنی اسپم)
     if(!globalThis.__rl) globalThis.__rl=new Map();
     sweepMemMap(globalThis.__rl, (ts, t)=>
       !Array.isArray(ts) || ts.length===0 || (t - ts[ts.length-1]) >= 60000, 5000);
-    {
-      const arr=(globalThis.__rl.get(memKey)||[]).filter(t=>now-t<60000);
-      if(arr.length>=lim) return false;
-      arr.push(now);
-      globalThis.__rl.set(memKey, arr);
-      if(arr.length<lim) return true;          // هنوز نزدیک سقف نیست ⇒ D1 لازم نیست
-    }
+    const arr=(globalThis.__rl.get(memKey)||[]).filter(t=>now-t<60000);
 
-    // لایهٔ ۲ — نزدیک/رد از سقف: شمارندهٔ سراسری D1 (بین ایزوله‌ها)
+    // 🔴 f13 (گزارش MEDIUM — rate limit ایزوله‌محلی نبود): لایهٔ حافظه دیگر
+    //    «اجازه» نمی‌دهد — فقط «ردِ سریع» اسپمِ همین ایزوله را ارزان می‌کند.
+    //    هر اجازهٔ واقعی از شمارندهٔ اتمیک D1 عبور می‌کند ⇒ سقف دقیقاً
+    //    بین همهٔ ایزوله‌ها مشترک است (RETURNING ⇒ افزایش+خواندن اتمیک).
+    if(arr.length>=lim) return false;
+
     const k="rl:"+String(uid)+":"+win;
     if(this.db){
       try{
         await this.ready();
-        // افزایش و خواندنِ مقدار نهایی در یک دستور (RETURNING) تا بین
-        // INSERT و SELECT هیچ درخواست دیگری شمارنده را عوض نکند.
         const sql="INSERT INTO store (key,value,expires_at) VALUES (?,?,?) "+
                   "ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER)+1 AS TEXT) "+
                   "RETURNING value";
@@ -2862,22 +2920,20 @@ class Store {
           const row=await this.db.prepare("SELECT value FROM store WHERE key=?").bind(k).first();
           n=Number(row&&row.value)||0;
         }
-        return n<=lim;
+        if(n>lim) return false;
+        arr.push(now);                       // برای ردِ سریعِ بعدیِ همین ایزوله
+        globalThis.__rl.set(memKey, arr);
+        return true;
       }catch(e){
         console.error("rateLimit d1", e&&e.message);
+        // قطعی D1 → لایهٔ محلی (fail-open: در دسترس‌بودن مقدم بر سخت‌گیری)
       }
     }
 
-    if(!globalThis.__rl) globalThis.__rl=new Map();
-    // ورودی‌هایی که کل مهرهای زمانی‌شان کهنه است دیگر به درد نمی‌خورند
-    sweepMemMap(globalThis.__rl, (ts, t)=>
-      !Array.isArray(ts) || ts.length===0 || (t - ts[ts.length-1]) >= 60000, 5000);
-    const key=String(uid);
-    let arr=globalThis.__rl.get(key)||[];
-    arr=arr.filter(t=>now-t<60000);
+    // بدون D1 یا قطعی: شمارش محلی ایزوله
     if(arr.length>=lim) return false;
     arr.push(now);
-    globalThis.__rl.set(key, arr);
+    globalThis.__rl.set(memKey, arr);
     return true;
   }
   async buildBackupSnapshot() {
@@ -2917,7 +2973,7 @@ class Store {
   async saveCfDeploy(c) { if(!c) await this.del(KEYS.CF_DEPLOY); else await this.put(KEYS.CF_DEPLOY,c); }
   async getDeployPending() { return this.get(KEYS.DEPLOY_PENDING); }
   async setDeployPending(script) { await this.put(KEYS.DEPLOY_PENDING, script); }
-  async clearDeployPending() { await this.del(KEYS.DEPLOY_PENDING); }
+  async clearDeployPending() { await this.del(KEYS.DEPLOY_PENDING, true); }
   async getPublicTrafficLedger() {
     const r=await this.get("cfg:pub_traffic");
     if(!r) return {}; // { [panelId]: { deletedBytes: number, updatedAt: number } }
@@ -2954,19 +3010,37 @@ class Store {
     cfg.channelAutoButton={...DEFAULT_PUBLIC_CFG.channelAutoButton, ...(cfg.channelAutoButton||{})};
     cfg.channelAutoButton=channelAutoCfg(cfg);
     if(!Array.isArray(cfg.configButtons)) cfg.configButtons=DEFAULT_PUBLIC_CFG.configButtons.map(x=>({...x}));
+    if(cfg._cfgRev==null) cfg._cfgRev=0;   // 🔴 f13: شمارهٔ نسخه برای ذخیرهٔ اتمیک
     _pubCfgCache=cfg;   // کش سراسری برای userReplyKb()
     this._pubCfgObj=cfg;
     this._pubCfgTtl=nowMs;
     return cfg;
   }
   async savePublicCfg(c) {
-    // invalidate/update cache atomically enough for this isolate; clone prevents later accidental mutation
+    // 🔴 f13 (گزارش MEDIUM — RMW race در publicCfg): الگوی «optimistic
+    //    concurrency» — همهٔ ۴۸ صداکننده اول getPublicCfg می‌خوانند (که
+    //    _cfgRev می‌گذارد)؛ اینجا زیر قفل، revِ ذخیره‌شده با revِ شیء
+    //    صداکننده مقایسه می‌شود. اگر نویسندهٔ دیگری در فاصله رفته باشد،
+    //    به‌جای lost update بی‌صدا، خطای روشن می‌دهیم (تلاش دوباره امن است).
+    await this.withLock("public_cfg", 10, async()=>{
+      const curRaw=await this.get(KEYS.PUBLIC_CFG);
+      let cur=null; try{ cur=curRaw?(typeof curRaw==="object"?curRaw:JSON.parse(curRaw)):null; }catch{ cur=null; }
+      const curRev=(cur&&Number(cur._cfgRev))||0;
+      const myRev=(c&&Number(c._cfgRev))||0;
+      if(myRev!==curRev){
+        const err=new Error("PUBLIC_CFG_CONFLICT: تنظیمات عمومی همزمان تغییر کرده؛ دوباره تلاش کنید.");
+        err.code="CFG_CONFLICT";
+        throw err;
+      }
+      c._cfgRev=curRev+1;
+      await this.put(KEYS.PUBLIC_CFG, c);
+    });
+    // کش فقط بعد از ذخیرهٔ موفق تازه شود
     _pubCfgCache={...DEFAULT_PUBLIC_CFG, ...(c||{})};
     if(_pubCfgCache.userButtons) _pubCfgCache.userButtons={...DEFAULT_PUBLIC_CFG.userButtons, ..._pubCfgCache.userButtons};
     if(_pubCfgCache.channelAutoButton) _pubCfgCache.channelAutoButton=channelAutoCfg(_pubCfgCache);
     this._pubCfgObj=null;   // کش را بی‌اعتبار کن تا تغییر فوری خوانده شود
     this._pubCfgTtl=0;
-    await this.put(KEYS.PUBLIC_CFG, c);
   }
   async getBotUsers() {
     const r=await this.get(KEYS.BOT_USERS);
@@ -4219,8 +4293,9 @@ class Bot {
     return s;
   }
   async saveSettings(s) {
-    this._settingsCache={data:s, ts:Date.now()};
+    // 🔴 f13: اول ذخیره (که ممکن است conflict بدهد) بعد کش
     await this.store.saveSettings(s);
+    this._settingsCache={data:s, ts:Date.now()};
   }
   /** پیام هشدار به مالک، با ضدّاسپم بر پایهٔ کلید */
   /**
@@ -8225,7 +8300,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       }
       // فاز ۳: نوشتن زیر قفل کوتاه
       try{
-        await this.store.withLock("pending_cfgs", 10, async()=>{
+        await this.store.withLock("pending_cfgs", 10, async(_lease)=>{
+          // 💓 f13: اگر lease از دست رفته، نوشتنِ صف ممنوع
+          if(_lease && _lease.lost) throw new Error("LOCK_LEASE_LOST: pending_cfgs");
           const raw2=await this.store.get(KEYS.PENDING_CFGS);
           let cur=[]; try{ cur=raw2?JSON.parse(raw2):[]; }catch{}
           const left=[];
@@ -20681,6 +20758,10 @@ export default {
         const tok=pj?String(pj.token||"").trim():"";
         const nu=pj?String(pj.url||"").trim():"";
         if(!pid||!tok) return deny("panelId and token required",400);
+        // 🔴 f13 fix (باگ runtime وارده در f11): متغیر classic در این scope
+        //    تعریف نشده بود و response با ReferenceError منفجر می‌شد —
+        //    تغییر credential انجام می‌شد ولی endpoint با 500 برمی‌گشت.
+        const classic=/^[^:\s]+:[^:\s]+$/.test(tok);
         // 🔒 f11: تغییر credential پنل از diag هم زیر قفل panels
         // (URL بد مثل قبل قبل از هر تغییر رد می‌شود — هیچ‌چیز persist نمی‌شود)
         let nu2=null;
