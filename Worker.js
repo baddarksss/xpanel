@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-18-f10";
+const CODE_STAMP = "2026-09-19-f11";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -2224,23 +2224,36 @@ class Store {
       // one-time migrate critical keys from KV → D1
       // اینجا خطای D1 نباید راه‌اندازی را قطع کند؛ بدترین حالت این است که
       // مهاجرت به دور بعد موکول شود (خودش idempotent است).
-      let migrated=null;
-      try{ migrated = await this._d1GetRaw("__migrated_from_kv"); }
-      catch(e){ console.error("D1 migrate-check", e&&e.message); migrated="1"; }
-      if(!migrated && this.kv){
-        const keys = [
-          KEYS.INSTALLED, KEYS.BOT_TOKEN, KEYS.OWNER_ID, KEYS.ENCRYPTION_KEY,
-          KEYS.WEBHOOK_URL, KEYS.WEBHOOK_INITIALIZED, KEYS.PANELS, KEYS.SETTINGS,
-          KEYS.ADMINS, KEYS.LANG, KEYS.PLANS, KEYS.LOGS, KEYS.WATCHLIST,
-          KEYS.ADMIN_PANELS, KEYS.CF_DEPLOY, KEYS.BOT_USERS, KEYS.PUBLIC_CFG, KEYS.BACKUPS
-        ];
+      // 🔴 f11 (گزارش — مهاجرت ناقص): سه اشکال نسخهٔ قبل اینجا بود:
+      //   ۱) خطای خواندنِ نشانگر → migrated="1" ⇒ کل مهاجرت دور زده می‌شد؛
+      //   ۲) خطای تک‌تک کلیدها بلعیده می‌شد ولی نشانگر همینطور نوشته می‌شد
+      //      ⇒ آن کلید «برای همیشه» ناقص می‌ماند؛
+      //   ۳) لیست کلیدها ناقص بود (WEBHOOK_SECRET/ADMIN_KEY/DIAG_TOKEN/...).
+      // حالا: لیست کامل = همهٔ KEYS؛ بازنویسیِ fill-if-missing (دادهٔ
+      // تازه‌ترِ D1 خراب نمی‌شود)؛ نشانگر فقط بعد از صفر خطا نوشته می‌شود،
+      // پس اجرای بعدی دوباره برای باقی‌مانده تلاش می‌کند.
+      let markerMissing=true;
+      try{
+        const m=await this._d1GetRaw("__migrated_from_kv");
+        markerMissing=(m==null);
+      }catch(e){ console.error("D1 migrate-check", e&&e.message); markerMissing=true; }
+      if(markerMissing && this.kv){
+        const keys = Object.values(KEYS);
+        let failed=0;
         for(const k of keys){
           try{
+            const cur=await this._d1GetRaw(k);
+            if(cur!=null) continue; // D1 خودش مقدار (تازه‌تر) دارد — بازنویسی ممنوع
             const v = await this.kv.get(k, {type:"text"});
             if(v!=null && v!=="") await this._d1PutRaw(k, v, null);
-          }catch{}
+          }catch(e){ failed++; console.error("migrate key", k, (e&&e.message)||e); }
         }
-        try{ await this._d1PutRaw("__migrated_from_kv", "1", null); }catch{}
+        if(!failed){
+          try{ await this._d1PutRaw("__migrated_from_kv", "1", null); }
+          catch(e){ console.error("migrate marker", e&&e.message); }
+        } else {
+          console.error("KV→D1 migration incomplete:", failed, "key(s) failed — will retry next boot");
+        }
       }
       return true;
     }catch(e){
@@ -2394,7 +2407,11 @@ class Store {
     let v=await this.get(KEYS.WEBHOOK_SECRET);
     if(typeof v==="string" && /^[A-Za-z0-9_-]{16,256}$/.test(v)) return v;
     v=randId(48);
-    try{ await this.put(KEYS.WEBHOOK_SECRET, v); }catch{}
+    // 🔴 f11 (گزارش — secret بلعیده‌شده): تا persist موفق نشود این secret
+    //    «معتبر» نیست. قبلاً خطای ذخیره بلعیده می‌شد و درخواست بعدی secret
+    //    دیگری می‌ساخت ⇒ تلگرام با secret قبلی ۴۰۳ می‌گرفت. حالا خطا بالا
+    //    می‌رود (fail-closed) تا ثبت/تعمیر وب‌هوک با خطای روشن متوقف شود.
+    await this.put(KEYS.WEBHOOK_SECRET, v);
     return v;
   }
   /** کلید مدیریتی برای endpointهای نگهداری (repair-webhook و ...) */
@@ -2551,6 +2568,76 @@ class Store {
       }catch(e){ console.error("releaseUpdateClaim d1", e&&e.message); return false; }
     }
     try{ globalThis.__updSeen && globalThis.__updSeen.delete("u"+String(updateId)); }catch{}
+    return true;
+  }
+  /**
+   * f11: اجرای یک بخش بحرانی read-modify-write زیر قفل توزیع‌شده.
+   * در قطعی D1 با acquireLock=false (fail-closed) اینجا صریحاً throw
+   * می‌کنیم — عملیات بدون قفل ادامه پیدا نمی‌کند تا lost update نشود.
+   * @param {string} key نام منطقی قفل (بدون پیشوند)
+   * @param {number} ttlSec TTL قفل
+   * @param {Function} fn بخش بحرانی
+   * @param {number} [timeoutMs] حداکثر انتظار برای گرفتن قفل (پیش‌فرض ۸ ثانیه)
+   */
+  async withLock(key, ttlSec, fn, timeoutMs) {
+    const deadline=Date.now()+(Number(timeoutMs)||8000);
+    let held=null;
+    while(Date.now()<deadline){
+      held=await this.acquireLock(String(key), ttlSec);
+      if(held) break;
+      await new Promise(r=>setTimeout(r, 60+Math.floor(Math.random()*60)));
+    }
+    if(!held){
+      const err=new Error("LOCK_TIMEOUT: could not acquire "+String(key)+" (storage degraded or busy)");
+      err.code="LOCKED";
+      throw err;
+    }
+    try{ return await fn(); }
+    finally{ try{ await this.releaseLock(String(key), held); }catch{} }
+  }
+  /**
+   * f11: claim اتمیک برای «عملیات» (مثل ساخت کلاینت روی panel+email).
+   * همان الگوی claimUpdate: INSERT … ON CONFLICT DO NOTHING با توکن مالکیت؛
+   * خروجی {s:"claimed",t}|{s:"seen"}|{s:"error"} — خطای D1 بلعیده نمی‌شود.
+   * کلید نهایی: lock:op:<opKey>
+   */
+  async claimOp(opKey, ttlSec) {
+    const k="lock:op:"+String(opKey);
+    if(this.db){
+      try{
+        await this.ready();
+        const tok=randId(20)+":"+Date.now();
+        const res=await this.db.prepare(
+          "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING"
+        ).bind(k, tok, Date.now()+(Number(ttlSec)||900)*1000).run();
+        const changed=(res&&res.meta&&typeof res.meta.changes==="number")
+          ? res.meta.changes
+          : (res&&typeof res.changes==="number" ? res.changes : null);
+        if(changed!=null) return changed>0 ? {s:"claimed",t:tok} : {s:"seen"};
+        const row=await this.db.prepare("SELECT value FROM store WHERE key=?").bind(k).first();
+        return (row && String(row.value)===tok) ? {s:"claimed",t:tok} : {s:"seen"};
+      }catch(e){ console.error("claimOp d1", e&&e.message); return {s:"error"}; }
+    }
+    if(!globalThis.__opClaims) globalThis.__opClaims=new Map();
+    const ok="o"+String(opKey);
+    if(globalThis.__opClaims.has(ok)) return {s:"seen"};
+    globalThis.__opClaims.set(ok, Date.now());
+    return {s:"claimed", t:null};
+  }
+  /** f11: آزادسازی claim عملیات — فقط با توکن مالکیت */
+  async releaseOp(opKey, token) {
+    const k="lock:op:"+String(opKey);
+    if(this.db){
+      try{
+        if(token){
+          await this.db.prepare("DELETE FROM store WHERE key=? AND value=?").bind(k, String(token)).run();
+        }else{
+          await this.db.prepare("DELETE FROM store WHERE key=?").bind(k).run();
+        }
+        return true;
+      }catch(e){ console.error("releaseOp d1", e&&e.message); return false; }
+    }
+    try{ globalThis.__opClaims && globalThis.__opClaims.delete("o"+String(opKey)); }catch{}
     return true;
   }
   async invalidate(pid) {
@@ -6685,16 +6772,22 @@ class Bot {
   }
 
   async _enqueuePendingConfig(uid, planId, chat, extra) {
-    let raw=null;
-    try{ raw=await this.store.get(KEYS.PENDING_CFGS); }catch{}
-    let list=[];
-    try{ list=raw?JSON.parse(raw):[]; }catch{ list=[]; }
-    if(!Array.isArray(list)) list=[];
-    list=list.filter(x=>String(x.uid)!==String(uid));
     const item={uid:String(uid), planId:String(planId||""), chat:chat||null, at:Date.now()};
     if(extra && typeof extra==="object") Object.assign(item, extra);
-    list.push(item);
-    try{ await this.store.put(KEYS.PENDING_CFGS, JSON.stringify(list)); }catch{}
+    // 🔒 f11 (گزارش — race در PENDING_CFGS): enqueue دیگر read-modify-write
+    //    آزاد نیست؛ زیر قفل صف انجام می‌شود تا ورودی همزمان‌ها پرت نشود.
+    //    در قطعی D1 قفل گرفته نمی‌شود ⇒ throw (fail-closed) — صفحهٔ وب‌هوک
+    //    خطا را می‌گیرد و تلگرام دوباره تلاش می‌کند.
+    await this.store.withLock("pending_cfgs", 10, async()=>{
+      let raw=null;
+      try{ raw=await this.store.get(KEYS.PENDING_CFGS); }catch{}
+      let list=[];
+      try{ list=raw?JSON.parse(raw):[]; }catch{ list=[]; }
+      if(!Array.isArray(list)) list=[];
+      list=list.filter(x=>String(x.uid)!==String(uid));
+      list.push(item);
+      await this.store.put(KEYS.PENDING_CFGS, JSON.stringify(list));
+    }, 6000);
   }
 
   async _notifyAdminsNoPublicPanel(reason) {
@@ -7070,11 +7163,22 @@ class Bot {
     let inboundIds=await this._publicInboundIds(dest, api);
     if(inboundIds&&!inboundIds.length) inboundIds=null;
 
+    // 🔴 f11 (گزارش — idempotency): claim اتمیک مهاجرت (panel+email) —
+    //    دو اجرای همزمانِ کرون/کاربر روی پنل مقصد دوباره نسازند.
+    const _opKey="add:"+String(dest.id)+":"+String(email);
+    const _op=await this.store.claimOp(_opKey, 900);
+    if(_op.s==="seen"){ try{ await this.addLog("migrate_busy","claim seen "+String(email), uid); }catch{} return null; }
+    if(_op.s==="error"){ return null; } // fail-closed: بدون claim مهاجرت نکن
     try{
       try{ await api.deleteClient(email); }catch{}
-      await api.addClient(email, remainingBytes, expiryTime, limitIp, inboundIds, {
-        tgId: uid, comment: "tg:"+uid+" migrated"
-      });
+      try{
+        await api.addClient(email, remainingBytes, expiryTime, limitIp, inboundIds, {
+          tgId: uid, comment: "tg:"+uid+" migrated"
+        });
+      }catch(e){
+        try{ await this.store.releaseOp(_opKey, _op.t); }catch{}
+        throw e;
+      }
       try{
         await api.updateClient(email, {
           enable:true,
@@ -7999,7 +8103,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       (Date.now()-at > PENDING_TTL ? stale : fresh).push(it);
     }
     if(stale.length){
-      try{ await this.store.put(KEYS.PENDING_CFGS, JSON.stringify(fresh)); }catch{}
+      // 🔒 f11: حذف منقضی‌ها زیر قفل صف — enqueue همزمان پرت نشود
+      try{ await this.store.withLock("pending_cfgs", 10, async()=>{ await this.store.put(KEYS.PENDING_CFGS, JSON.stringify(fresh)); }, 6000); }catch{}
       for(const it of stale){
         try{
           await this.tg.call("sendMessage",{chat_id: it.chat||it.uid,
@@ -8053,23 +8158,41 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         await this.userCreateFromPlan(chat, 0, uid, planId, {silent:true});
       }catch(e){ console.error("pending cfg", e&&e.message); }
     }
-    // prune fulfilled
+    // prune fulfilled — 🔒 f11: خواندن و نوشتن نهایی زیر قفل صف؛ بین خواندن
+    // و نوشتن فقط checkهای سبک می‌ماند (userFindActiveAccount شبکه دارد؛
+    // ریسک طول‌شدن قفل وجود ندارد چون فقط برای آیتم‌های باقی‌مانده چک می‌شود
+    // و TTL قفل ۳۰ ثانیه است؛ در بدترین حالت prune شکست می‌خورد و دور بعد
+    // تکرار می‌شود — ورودی‌ها پرت نمی‌شوند).
     let left=[];
+    let pruned=0;
     try{
-      const raw2=await this.store.get(KEYS.PENDING_CFGS);
-      const cur=raw2?JSON.parse(raw2):[];
-      for(const item of (Array.isArray(cur)?cur:[])){
-        if(item && item.type==="migrate" && item.snapshot){
-          const snap=item.snapshot||{};
-          // snapshot تاریخ‌گذشته را در صف نگه ندار؛ ساخت اکانت تاریخ‌گذشته ممنوع است.
-          if(!((Number(snap.expiryTime)||0)>Date.now() && (Number(snap.remainingBytes)||0)>0)) continue;
+      await this.store.withLock("pending_cfgs", 30, async()=>{
+        const raw2=await this.store.get(KEYS.PENDING_CFGS);
+        const cur=raw2?JSON.parse(raw2):[];
+        left=[];
+        for(const item of (Array.isArray(cur)?cur:[])){
+          if(item && item.type==="migrate" && item.snapshot){
+            const snap=item.snapshot||{};
+            // snapshot تاریخ‌گذشته را در صف نگه ندار؛ ساخت اکانت تاریخ‌گذشته ممنوع است.
+            if(!((Number(snap.expiryTime)||0)>Date.now() && (Number(snap.remainingBytes)||0)>0)){ pruned++; continue; }
+          }
+          const active=await this.userFindActiveAccount(item.uid,{publicOnly:false});
+          if(!(active&&active.reachable&&active.client&&!active.expired)) left.push(item);
+          else pruned++;
         }
-        const active=await this.userFindActiveAccount(item.uid,{publicOnly:false});
-        if(!(active&&active.reachable&&active.client&&!active.expired)) left.push(item);
-      }
-    }catch{}
-    try{ await this.store.put(KEYS.PENDING_CFGS, JSON.stringify(left)); }catch{}
-    return (list.length-(left||[]).length);
+        await this.store.put(KEYS.PENDING_CFGS, JSON.stringify(left));
+      }, 25000);
+    }catch{
+      // قفل نشد ⇒ دست به صف نمی‌زنیم (هیچ‌چیز گم نمی‌شود؛ دور بعد تلاش می‌شود)
+      left=null;
+    }
+    if(left==null){
+      const raw3=await this.store.get(KEYS.PENDING_CFGS).catch(()=>null);
+      let cur=[]; try{ cur=raw3?JSON.parse(raw3):[]; }catch{}
+      left=(Array.isArray(cur)?cur:[]);
+      pruned=0;
+    }
+    return (list.length-left.length);
   }
 
   /**
@@ -8333,6 +8456,17 @@ if(active && active.reachable && active.client && !active.expired && !active.not
             await _api.updateClient(_email, { enable:true, tgId: Number(uid)||0 });
           }catch{}
         } else {
+          // 🔴 f11 (گزارش — idempotency ucreate): ادعای اتمیک (panel+email)
+          //    پیش از ساخت — دو اجرای همزمان (دابل‌کلیک/بازارسال) دیگر هر دو
+          //    addClient نمی‌زنند. claimed ⇒ ادامه؛ seen ⇒ «همین حالا دارد
+          //    ساخته می‌شود»؛ error ⇒ fail-closed. claim موفق تمدید نمی‌شود و
+          //    ۱۵ دقیقه به‌عنوان نشانهٔ «ساخته شد/در حال ساخت» می‌ماند.
+          const _opKey="add:"+String(_best&&_best.id)+":"+String(_email);
+          const _op=await this.store.claimOp(_opKey, 900);
+          if(_op.s!=="claimed"){
+            throw new Error("CREATE_IN_PROGRESS: این کانفیگ همین حالا ساخته می‌شود یا ثبت اتمیک ساخت ممکن نشد؛ چند لحظه بعد دوباره تلاش کنید. ("+_op.s+")");
+          }
+          const _opTok=_op.t;
           try{ await _api.deleteClient(_email); }catch{}
           try{
             await _api.addClient(_email, _totalBytes, _expiryMs, 0, _inboundIds, {tgId: uid, comment: "tg:"+uid});
@@ -8360,10 +8494,14 @@ if(active && active.reachable && active.client && !active.expired && !active.not
                   lastErr="";
                 }catch(e2){
                   lastErr=(e2&&e2.message)||lastErr||"create failed";
+                  // 🔴 f11: ساخت کامل نشد ⇒ claim آزاد شود تا تلاش دوباره ممکن باشد
+                  try{ await this.store.releaseOp("add:"+String(_best&&_best.id)+":"+String(_email), _opTok); }catch{}
                   throw new Error(lastErr);
                 }
               }
             }catch(e3){
+              // 🔴 f11: همینطور اینجا
+              try{ await this.store.releaseOp("add:"+String(_best&&_best.id)+":"+String(_email), _opTok); }catch{}
               if(lastErr) throw new Error(lastErr);
               throw e3;
             }
@@ -8475,10 +8613,13 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         // رزرو قبلاً در _pickPublicPanel ثبت شده است (اتمیک، زیر قفل pubcap).
         // اینجا دوباره ثبت نمی‌کنیم وگرنه همان حجم دو بار شمرده می‌شود.
         try{
-          const raw=await this.store.get(KEYS.PENDING_CFGS);
-          let list=raw?JSON.parse(raw):[];
-          list=(Array.isArray(list)?list:[]).filter(x=>String(x.uid)!==String(uid));
-          await this.store.put(KEYS.PENDING_CFGS, JSON.stringify(list));
+          // 🔒 f11: خروج از صف هم زیر قفل — ورودیِ همزمانِ دیگران پرت نشود
+          await this.store.withLock("pending_cfgs", 10, async()=>{
+            const raw=await this.store.get(KEYS.PENDING_CFGS);
+            let list=raw?JSON.parse(raw):[];
+            list=(Array.isArray(list)?list:[]).filter(x=>String(x.uid)!==String(uid));
+            await this.store.put(KEYS.PENDING_CFGS, JSON.stringify(list));
+          }, 6000);
         }catch{}
         let links=[];
         try{
@@ -13721,9 +13862,12 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const lang=await this.lang();
     const state=await this.store.getState(uid);
     if(!state) return;
-    const panels=await this.store.getPanels();
-    const p=panels.find(x=>x.id===state.data.pid);
-    if(p){p.token=token;await this.store.savePanels(panels);}
+    // 🔒 f11: read-modify-write پنل‌ها زیر قفل توزیع‌شده (گزارش — lost update)
+    await this.store.withLock("panels", 15, async()=>{
+      const panels=await this.store.getPanels();
+      const p=panels.find(x=>x.id===state.data.pid);
+      if(p){p.token=token;await this.store.savePanels(panels);}
+    });
     await this.store.clearState(uid);
     await this.tg.msg(chat,t(lang,"panel_updated"),{reply_markup:(await this.panelsMenu())});
   }
@@ -13944,7 +14088,17 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         const chkP=this._clampUserDays(panel, d.parseDays, lang);
         if(!chkP.ok){ await this.store.clearState(strUid); return this.tg.msg(chat,"❌ "+chkP.msg); }
         const em=chkP.days>0?Date.now()+chkP.days*86400000:0;
-        await api.addClient(d.parseEmail,tb,em,0,selected);
+        // 🔴 f11 (گزارش — idempotency): claim اتمیک (panel+email) پیش از addClient
+        let _opKey="add:"+String(d.panel_id)+":"+String(d.parseEmail);
+        const _op=await this.store.claimOp(_opKey, 900);
+        if(_op.s==="seen"){ await this.store.clearState(strUid); return this.tg.msg(chat,"⏳ همین کانفیگ همین حالا ساخته می‌شود؛ چند لحظه بعد «کانفیگ‌های من» را چک کنید."); }
+        if(_op.s==="error"){ await this.store.clearState(strUid); return this.tg.msg(chat,"❌ خطای ذخیره‌ساز؛ چند لحظه بعد دوباره تلاش کنید."); }
+        try{
+          await api.addClient(d.parseEmail,tb,em,0,selected);
+        }catch(e){
+          try{ await this.store.releaseOp(_opKey, _op.t); }catch{}
+          throw e;
+        }
         await this.store.invalidate(d.panel_id);
         await this.addLog("create_parse", d.parseEmail, strUid);
         await this.store.clearState(strUid);
@@ -14007,7 +14161,17 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           if(pEndMs>Date.now()) expiryMs=Math.min(expiryMs, pEndMs);
         }
       }
-      await api.addClient(email,totalBytes,expiryMs,parseInt(ipLimit)||0,inbound_ids||[]);
+      // 🔴 f11 (گزارش — idempotency): claim اتمیک (panel+email) پیش از addClient
+      const _opKey="add:"+String(panel_id)+":"+String(email);
+      const _op=await this.store.claimOp(_opKey, 900);
+      if(_op.s==="seen"){ await this.store.clearState(uid); return this.tg.msg(chat,"⏳ همین کانفیگ همین حالا ساخته می‌شود؛ چند لحظه بعد چک کنید.",{reply_markup:(await this.mainMenu())}); }
+      if(_op.s==="error"){ await this.store.clearState(uid); return this.tg.msg(chat,"❌ خطای ذخیره‌ساز؛ چند لحظه بعد دوباره تلاش کنید.",{reply_markup:(await this.mainMenu())}); }
+      try{
+        await api.addClient(email,totalBytes,expiryMs,parseInt(ipLimit)||0,inbound_ids||[]);
+      }catch(e){
+        try{ await this.store.releaseOp(_opKey, _op.t); }catch{}
+        throw e;
+      }
       await this.store.clearState(uid);
       await this.store.invalidate(panel_id);
       await this.addLog("create", email, uid);
@@ -15540,11 +15704,14 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     if(!state||!state.data||state.data.pid==null) return;
     const pid=state.data.pid;
     const num=parseFloat(String(text).replace(",","."))||0;
-    const panels=await this.store.getPanels();
-    const p=panels.find(x=>String(x.id)===String(pid));
-    if(!p){ await this.store.clearState(uid); return; }
-    p.trafficLimitGB=num>0?num:null;
-    await this.store.savePanels(panels);
+    // 🔒 f11: read-modify-write پنل‌ها زیر قفل توزیع‌شده
+    await this.store.withLock("panels", 15, async()=>{
+      const panels=await this.store.getPanels();
+      const p=panels.find(x=>String(x.id)===String(pid));
+      if(!p) return;
+      p.trafficLimitGB=num>0?num:null;
+      await this.store.savePanels(panels);
+    });
     await this.store.clearState(uid);
     const lang=await this.lang();
     await this.tg.msg(chat,
@@ -15636,8 +15803,6 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const state=await this.store.getState(uid);
     if(!state) return;
     const {name,url,token}=state.data;
-    const panels=await this.store.getPanels();
-    const newId=panels.length?Math.max(...panels.map(p=>p.id))+1:1;
     const expiryDaysNum=parseInt(expiryDays)||0;
     let expiryDate=null;
     let expiryNote="";
@@ -15650,17 +15815,22 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     } else {
       expiryNote=L(lang,"\n📅 انقضا: *نامحدود*","\n📅 Expiry: *Unlimited*");
     }
-    const panelData={
-      id:newId,
-      name,
-      url,
-      token,
-      enabled:true,
-      created_at:new Date().toISOString(),
-      expiryDate: expiryDate
-    };
-    panels.push(panelData);
-    await this.store.savePanels(panels);
+    // 🔒 f11: ساخت پنل زیر قفل — newId هم داخل قفل محاسبه می‌شود تا دو
+    // پنل همزمان id یکسان نگیرند و آرایه هم lost update نشود.
+    await this.store.withLock("panels", 15, async()=>{
+      const panels=await this.store.getPanels();
+      const newId=panels.length?Math.max(...panels.map(p=>p.id))+1:1;
+      panels.push({
+        id:newId,
+        name,
+        url,
+        token,
+        enabled:true,
+        created_at:new Date().toISOString(),
+        expiryDate: expiryDate
+      });
+      await this.store.savePanels(panels);
+    });
     await this.store.clearState(uid);
     // ℹ️ پنل تازه در *هیچ* دسته‌ای نیست: نه در publicPanelIds ثبت می‌شود
     //    و نه جایی به‌عنوان «عمومی» علامت می‌خورد. انتخاب با ادمین است.
@@ -15818,11 +15988,13 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
   async onEditPanelExpiry(chat,uid,expiryDays) {
     const state=await this.store.getState(uid);
-    const panels=await this.store.getPanels();
-    const p=panels.find(x=>x.id===state.data.pid);
     const lang=await this.lang();
     let note="";
-    if(p){
+    // 🔒 f11: read-modify-write پنل‌ها زیر قفل توزیع‌شده
+    await this.store.withLock("panels", 15, async()=>{
+      const panels=await this.store.getPanels();
+      const p=panels.find(x=>x.id===state.data.pid);
+      if(!p) return;
       const expiryDaysNum=parseInt(expiryDays)||0;
       if(expiryDaysNum > 0) {
         const d = new Date();
@@ -15834,7 +16006,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         note = t(lang,"panel_expiry_unlimited");
       }
       await this.store.savePanels(panels);
-    }
+    });
     await this.store.clearState(uid);
     await this.tg.msg(chat,"✅ "+t(lang,"panel_expiry_label")+" *"+note+"*",{reply_markup:(await this.panelsMenu())});
   }
@@ -15843,11 +16015,15 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const state=await this.store.getState(uid);
     const nm=String(name||"").trim();
     if(!nm) return this.tg.msg(chat,L(lang,"نام خالی نباشد.","Name cannot be empty."));
-    const panels=await this.store.getPanels();
-    const p=panels.find(x=>String(x.id)===String(state&&state.data&&state.data.pid));
-    if(p){ p.name=nm; await this.store.savePanels(panels); }
+    // 🔒 f11: read-modify-write پنل‌ها زیر قفل توزیع‌شده
+    let renamed="";
+    await this.store.withLock("panels", 15, async()=>{
+      const panels=await this.store.getPanels();
+      const p=panels.find(x=>String(x.id)===String(state&&state.data&&state.data.pid));
+      if(p){ p.name=nm; await this.store.savePanels(panels); renamed=p.name; }
+    });
     await this.store.clearState(uid);
-    try{ await this.addLog("panel_rename", (p?p.name:"") , uid); }catch{}
+    try{ await this.addLog("panel_rename", (renamed||"") , uid); }catch{}
     await this.tg.msg(chat,L(lang,"✅ نام پنل شد: *","✅ Panel name is now: *")+esc(nm)+"*",
       {reply_markup:kb([[btn(L(lang,"✏ ادامه ویرایش","✏ Keep editing"),"sel_edit:"+(p?p.id:"")), btn(L(lang,"◀ پنل‌ها","◀ Panels"),"m:panels")]])});
   }
@@ -15871,16 +16047,19 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const lang=await this.lang();
     const state=await this.store.getState(uid);
     if(!state||!state.data) return;
-    const panels=await this.store.getPanels();
-    const p=panels.find(x=>String(x.id)===String(state.data.pid));
     const nextUrl=String(url||"").trim();
-    const prevUrl=String((state.data&&state.data.cur_url)||(p&&p.url)||"").trim();
-    const urlChanged=!!(p && nextUrl && this._normPanelUrl(nextUrl)!==this._normPanelUrl(prevUrl));
-    if(p){
+    // 🔒 f11: read-modify-write پنل‌ها زیر قفل توزیع‌شده
+    let p=null; let urlChanged=false;
+    await this.store.withLock("panels", 15, async()=>{
+      const panels=await this.store.getPanels();
+      p=panels.find(x=>String(x.id)===String(state.data.pid))||null;
+      if(!p) return;
+      const prevUrl=String((state.data&&state.data.cur_url)||p.url||"").trim();
+      urlChanged=!!(nextUrl && this._normPanelUrl(nextUrl)!==this._normPanelUrl(prevUrl));
       p.name=state.data.new_name||p.name;
       if(urlChanged) p.url=nextUrl;
       await this.store.savePanels(panels);
-    }
+    });
     await this.store.clearState(uid);
     if(urlChanged && p){
       await this.tg.msg(chat,
@@ -16202,8 +16381,20 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const st=await this.store.getState("dpmulti");
     const sel=(st&&st.data&&Array.isArray(st.data.sel))?st.data.sel.slice():[];
     if(!sel.length) return this.startDeletePanel(chat,mid);
-    let panels=await this.store.getPanels();
-    const names=[];
+    // 🔒 f11: حذف چندگانه — فیلتر و ذخیرهٔ آرایهٔ پنل‌ها زیر قفل توزیع‌شده؛
+    // پاک‌سازی ارجاع‌ها (شبکه/store) بیرون از قفل انجام می‌شود.
+    const names=[]; const purgedIds=[];
+    await this.store.withLock("panels", 15, async()=>{
+      let panels=await this.store.getPanels();
+      for(const pid of sel){
+        const panel=panels.find(p=>String(p.id)===String(pid));
+        if(!panel) continue;
+        names.push(panel.name);
+        panels=panels.filter(p=>String(p.id)!==String(pid));
+        purgedIds.push(pid);
+      }
+      if(purgedIds.length) await this.store.savePanels(panels);
+    });
     let affected=0;
     try{
       const users=await this.store.getBotUsers();
@@ -16212,14 +16403,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         if(u && u.email && sel.includes(String(u.panelId))) affected++;
       }
     }catch{}
-    for(const pid of sel){
-      const panel=panels.find(p=>String(p.id)===String(pid));
-      if(!panel) continue;
-      names.push(panel.name);
-      panels=panels.filter(p=>String(p.id)!==String(pid));
+    for(const pid of purgedIds){
       try{ await this._purgePanelRefs(pid); }catch(e){ console.error("purge panel refs", pid, e&&e.message); }
     }
-    await this.store.savePanels(panels);
     try{ await this.store.del("s:dpmulti"); }catch{}
     let extra="";
     if(affected>0){
@@ -16259,8 +16445,14 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
   async onDeletePanelExecute(chat,mid,pid) {
     const lang=await this.lang();
-    let panels=await this.store.getPanels();
-    const panel=panels.find(p=>String(p.id)===String(pid));
+    // 🔒 f11: حذف پنل — فیلتر و ذخیرهٔ آرایه زیر قفل توزیع‌شده
+    let panel=null;
+    await this.store.withLock("panels", 15, async()=>{
+      const panels=await this.store.getPanels();
+      panel=panels.find(p=>String(p.id)===String(pid))||null;
+      if(!panel) return;
+      await this.store.savePanels(panels.filter(p=>String(p.id)!==String(pid)));
+    });
     if(!panel) return this.editOrSend(chat,mid,"Panel not found.",(await this.panelsMenu()));
 
     // قبل از حذف، کاربرانی که روی این پنل کانفیگ دارند را بشمار
@@ -16272,9 +16464,6 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         if(u && u.email && String(u.panelId)===String(pid)) affected++;
       }
     }catch{}
-
-    panels=panels.filter(p=>String(p.id)!==String(pid));
-    await this.store.savePanels(panels);
 
     // ---- پاک‌سازی داده‌های یتیم مربوط به پنل حذف‌شده ----
     try{ await this._purgePanelRefs(pid); }catch(e){ console.error("purge panel refs", e&&e.message); }
@@ -16333,7 +16522,12 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           if(next){ v.panels=next; dirty=true; }
         }
       }
-      if(dirty) await this.store.saveAdminPanels(ap);
+      if(dirty){
+        // 🔒 f11: نوشتن prune شدهٔ admin_panels زیر قفل (بخشی از RMW است)
+        try{
+          await this.store.withLock("admin_panels", 10, async()=>{ await this.store.saveAdminPanels(ap); });
+        }catch{}
+      }
     }catch{}
 
     // نکته ۱: صف کانفیگ‌های در انتظار (PENDING_CFGS) بر اساس planId است
@@ -16355,40 +16549,40 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
   async onEnablePickPanel(chat,mid,pid) {
     const lang=await this.lang();
-    // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — Critical ۲): به‌جای getPanels() کامل،
-    //    فقط پنل‌های مجازِ همین ادمین (panelsForUser) — وگرنه callback جعلیِ
-    //    «sel_dis:all» تمام پنل‌های همهٔ ادمین‌ها را خاموش می‌کرد.
-    const panels=await this.panelsForUser(this._uid);
+    // 🔴 f10: فقط پنل‌های مجازِ همین ادمین (panelsForUser).
+    // 🔴 f11 (اشکال f10 + گزارش lost update): آرایهٔ «کامل» زیر قفل خوانده و
+    //    ذخیره می‌شود ولی فقط پنل‌هایِ مجازِ همین ادمین تغییر می‌کنند —
+    //    قبلاً panelsForUser (زیرمجموعه) مستقیم savePanels می‌شد و پنل‌های
+    //    دیگرِ ذخیره‌نشده حذف می‌شدند! حلقهٔ شبکه‌ای پنل‌ها هم بیرون قفل است.
+    const allowed=(await this.panelsForUser(this._uid)).map(p=>String(p.id));
+    const allowedSet=new Set(allowed);
+    const targets=(pid==="all")?allowed:[String(pid)];
+    const flipped=[];
+    await this.store.withLock("panels", 15, async()=>{
+      const all=await this.store.getPanels();
+      let dirty=false;
+      for(const p of all){
+        if(!allowedSet.has(String(p.id))) continue;
+        if(!targets.includes(String(p.id))) continue;
+        if(!p.enabled){ p.enabled=true; dirty=true; flipped.push(p.id); }
+      }
+      if(dirty) await this.store.savePanels(all);
+    });
     if (pid === "all") {
       await this.editOrSend(chat,mid,L(lang,"⏳ در حال فعال‌سازی تمامی پنل‌ها و کاربران...","⏳ Enabling all panels and users..."),kb([]));
-      for (const p of panels) {
-        if (!p.enabled) {
-          p.enabled = true;
-          try {
-            const api=new PanelApi(p.name,p.url,p.token,p.id);
-            const clients = await api.getClients();
-            await Promise.all(clients.map(async (c) => {
-              if (!c.enable) { try { await api.updateClient(c.email, { enable: true }); } catch {} }
-            }));
-          } catch {}
-        }
-      }
-      await this.store.savePanels(panels);
-      await this.editOrSend(chat,mid,L(lang,"✅ تمامی پنل‌ها و کاربرانی آن‌ها با موفقیت فعال شدند.","✅ All panels and their users were enabled."),(await this.panelsMenu()));
-      return;
-    }
-    const p=panels.find(x=>String(x.id)===String(pid));
-    if(p){
-      p.enabled=true;
-      await this.store.savePanels(panels);
+    } else if(flipped.length){
       await this.editOrSend(chat,mid,L(lang,"⏳ در حال فعال‌سازی تمامی کاربرانی پنل...","⏳ Enabling all users on the panel..."),kb([]));
+    }
+    for(const fp of flipped){
+      const p=(await this.panelsForUser(this._uid)).find(x=>String(x.id)===String(fp));
+      if(!p) continue;
       try {
         const api=new PanelApi(p.name,p.url,p.token,p.id);
         const clients = await api.getClients();
         await Promise.all(clients.map(async (c) => {
           if (!c.enable) { try { await api.updateClient(c.email, { enable: true }); } catch {} }
         }));
-      } catch (e) { console.error("enable clients err", e.message); }
+      } catch (e) { console.error("enable clients err", (e&&e.message)||e); }
     }
     await this.editOrSend(chat,mid,L(lang,"✅ پنل و تمامی کاربرانی آن با موفقیت فعال شدند.","✅ Panel and all of its users were enabled."),(await this.panelsMenu()));
   }
@@ -16404,38 +16598,37 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
   async onDisablePickPanel(chat,mid,pid) {
     const lang=await this.lang();
-    // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — Critical ۲): فقط پنل‌های مجاز همین ادمین.
-    const panels=await this.panelsForUser(this._uid);
+    // 🔴 f10: فقط پنل‌های مجازِ همین ادمین. 🔴 f11: آرایهٔ کامل زیر قفل +
+    //    تغییر فقط زیرمجموعهٔ مجاز + حلقهٔ شبکه‌ای بیرون قفل (توضیح: E9).
+    const allowed=(await this.panelsForUser(this._uid)).map(p=>String(p.id));
+    const allowedSet=new Set(allowed);
+    const targets=(pid==="all")?allowed:[String(pid)];
+    const flipped=[];
+    await this.store.withLock("panels", 15, async()=>{
+      const all=await this.store.getPanels();
+      let dirty=false;
+      for(const p of all){
+        if(!allowedSet.has(String(p.id))) continue;
+        if(!targets.includes(String(p.id))) continue;
+        if(p.enabled){ p.enabled=false; dirty=true; flipped.push(p.id); }
+      }
+      if(dirty) await this.store.savePanels(all);
+    });
     if (pid === "all") {
       await this.editOrSend(chat,mid,L(lang,"⏳ در حال غیرفعال‌سازی تمامی پنل‌ها و کاربران...","⏳ Disabling all panels and users..."),kb([]));
-      for (const p of panels) {
-        if (p.enabled) {
-          p.enabled = false;
-          try {
-            const api=new PanelApi(p.name,p.url,p.token,p.id);
-            const clients = await api.getClients();
-            await Promise.all(clients.map(async (c) => {
-              if (c.enable) { try { await api.updateClient(c.email, { enable: false }); } catch {} }
-            }));
-          } catch {}
-        }
-      }
-      await this.store.savePanels(panels);
-      await this.editOrSend(chat,mid,L(lang,"⛔ تمامی پنل‌ها و کاربرانی آن‌ها با موفقیت غیرفعال شدند.","⛔ All panels and their users were disabled."),(await this.panelsMenu()));
-      return;
-    }
-    const p=panels.find(x=>String(x.id)===String(pid));
-    if(p){
-      p.enabled=false;
-      await this.store.savePanels(panels);
+    } else if(flipped.length){
       await this.editOrSend(chat,mid,L(lang,"⏳ در حال غیرفعال‌سازی تمامی کاربرانی پنل...","⏳ Disabling all users on the panel..."),kb([]));
+    }
+    for(const fp of flipped){
+      const p=(await this.panelsForUser(this._uid)).find(x=>String(x.id)===String(fp));
+      if(!p) continue;
       try {
         const api=new PanelApi(p.name,p.url,p.token,p.id);
         const clients = await api.getClients();
         await Promise.all(clients.map(async (c) => {
           if (c.enable) { try { await api.updateClient(c.email, { enable: false }); } catch {} }
         }));
-      } catch (e) { console.error("disable clients err", e.message); }
+      } catch (e) { console.error("disable clients err", (e&&e.message)||e); }
     }
     await this.editOrSend(chat,mid,L(lang,"⛔ پنل و تمامی کاربرانی آن با موفقیت غیرفعال شدند.","⛔ Panel and all of its users were disabled."),(await this.panelsMenu()));
   }
@@ -17119,7 +17312,14 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     if(!(await this.isOwner(uid))){
       return this.editOrSend(chat,mid,L(lang,"⛔ فقط مالک","⛔ Owner only"),(await this.backMain()));
     }
-    const secret=await this.store.getWebhookSecret();
+    let secret=null;
+    try{ secret=await this.store.getWebhookSecret(); }
+    catch(e){
+      // f11: getWebhookSecret در fail ذخیره‌سازی throw می‌کند — اینجا پیام روشن بده
+      return this.editOrSend(chat,mid,
+        L(lang,"⛔ خطای ذخیره‌ساز در خواندن/ساخت کلید وب‌هوک: ","⛔ Storage error reading/creating webhook secret: ")+String((e&&e.message)||e),
+        (await this.backMain()));
+    }
     const applied=await this.store.get(KEYS.WEBHOOK_SECRET_APPLIED);
     const adminKey=await this.store.getAdminKey();
     const whOk=(applied===secret);
@@ -17989,8 +18189,18 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const chkP=this._clampUserDays(p, Number(plan.days)||0, lang);
     if(!chkP.ok) return this.tg.msg(chat,"❌ "+chkP.msg);
     const expiryMs=chkP.days>0?Date.now()+chkP.days*86400000:0;
+    // 🔴 f11 (گزارش — idempotency): claim اتمیک (panel+email) پیش از addClient
+    let _opKey="add:"+String(panel_id)+":"+String(email);
+    const _op=await this.store.claimOp(_opKey, 900);
+    if(_op.s==="seen"){ return this.tg.msg(chat,"⏳ همین کانفیگ همین حالا ساخته می‌شود؛ چند لحظه بعد چک کنید."); }
+    if(_op.s==="error"){ return this.tg.msg(chat,"❌ خطای ذخیره‌ساز؛ چند لحظه بعد دوباره تلاش کنید."); }
     try{
-      await api.addClient(email, (Number(plan.trafficGB)||0)>0?Math.round(Number(plan.trafficGB)*1073741824):0, expiryMs, 0, inbound_ids||null, {});
+      try{
+        await api.addClient(email, (Number(plan.trafficGB)||0)>0?Math.round(Number(plan.trafficGB)*1073741824):0, expiryMs, 0, inbound_ids||null, {});
+      }catch(e){
+        try{ await this.store.releaseOp(_opKey, _op.t); }catch{}
+        throw e;
+      }
       await this.store.clearState(uid);
       try{ await this.addLog("plan_create", email+" "+plan.name, uid); }catch{}
       let links=""; try{ links=await api.getLinks(email); }catch{}
@@ -18395,12 +18605,34 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
 
   async saveAdminAccess(adminId, access) {
-    const map=await this.store.getAdminPanels();
-    map[String(adminId)] = {
-      panels: (access.panels||[]).map(String),
-      features: access.features||{}
-    };
-    await this.store.saveAdminPanels(map);
+    // 🔒 f11 (گزارش — race در saveAdminAccess): کل نقشه کورکورانه بازنویسی
+    // نمی‌شود؛ زیر قفل admin_panels فقط مدخلِ همین ادمین جایگزین می‌شود تا
+    // تغییر همزمانِ ادمین‌های دیگر overwrite نشود.
+    await this.store.withLock("admin_panels", 10, async()=>{
+      const map=await this.store.getAdminPanels();
+      map[String(adminId)] = {
+        panels: (access.panels||[]).map(String),
+        features: access.features||{}
+      };
+      await this.store.saveAdminPanels(map);
+    });
+  }
+  /**
+   * f11: خواندن-تغییر-ذخیرهٔ اتمیک دسترسی «یک» ادمین (برای toggleها).
+   * خواندن هم داخل قفل است، پس دو کلیک همزمان روی همان ادمین هم گم نمی‌شود.
+   */
+  async mutateAdminAccess(adminId, fn) {
+    return this.store.withLock("admin_panels", 10, async()=>{
+      const acc=await this.getAdminAccess(adminId);
+      await fn(acc);
+      const map=await this.store.getAdminPanels();
+      map[String(adminId)] = {
+        panels: (acc.panels||[]).map(String),
+        features: acc.features||{}
+      };
+      await this.store.saveAdminPanels(map);
+      return acc;
+    });
   }
 
   async adminCan(uid, feature) {
@@ -18459,21 +18691,22 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const parts=rest.split(":");
     const adminId=parts[0];
     const pid=parts[1];
-    const acc=await this.getAdminAccess(adminId);
-    let arr=acc.panels.map(String);
-    if(arr.includes(String(pid))) arr=arr.filter(x=>x!==String(pid));
-    else arr.push(String(pid));
-    acc.panels=arr;
-    await this.saveAdminAccess(adminId, acc);
+    // 🔒 f11: toggle زیر قفل — کلیک همزمان دسترسی‌ها را پاک نمی‌کند
+    await this.mutateAdminAccess(adminId, async(acc)=>{
+      const arr=acc.panels.map(String);
+      if(arr.includes(String(pid))) acc.panels=arr.filter(x=>x!==String(pid));
+      else { arr.push(String(pid)); acc.panels=arr; }
+    });
     return this.onAdminPanelPickAdmin(chat,mid,uid,adminId);
   }
   async onAdminFeatToggle(chat,mid,uid,rest) {
     const parts=rest.split(":");
     const adminId=parts[0];
     const feat=parts[1];
-    const acc=await this.getAdminAccess(adminId);
-    acc.features[feat] = !(acc.features[feat]!==false);
-    await this.saveAdminAccess(adminId, acc);
+    // 🔒 f11: toggle زیر قفل
+    await this.mutateAdminAccess(adminId, async(acc)=>{
+      acc.features[feat] = !(acc.features[feat]!==false);
+    });
     return this.onAdminPanelPickAdmin(chat,mid,uid,adminId);
   }
 
@@ -20318,12 +20551,17 @@ export default {
         let uu; try{ uu=new URL(nu); }catch{ return deny("bad url",400); }
         if(uu.protocol!=="https:"&&uu.protocol!=="http:") return deny("bad scheme",400);
         if(!/^[A-Za-z0-9.\-]+$/.test(uu.hostname)) return deny("bad hostname",400);
-        const panelsAll=await store.getPanels();
-        const p=(panelsAll||[]).find(x=>String(x.id)===String(pid));
+        // 🔒 f11: تغییر credential پنل از diag هم زیر قفل panels
+        let p=null; let oldHost="?";
+        await store.withLock("panels", 15, async()=>{
+          const panelsAll=await store.getPanels();
+          p=(panelsAll||[]).find(x=>String(x.id)===String(pid))||null;
+          if(!p) return;
+          try{ oldHost=new URL(String(p.url)).host; }catch{ oldHost="?"; }
+          p.url=uu.origin+(uu.pathname&&uu.pathname!=="/"?uu.pathname.replace(/\/+$/,""):"");
+          await store.savePanels(panelsAll);
+        });
         if(!p) return deny("panel not found",404);
-        const oldHost=(()=>{ try{ return new URL(String(p.url)).host; }catch{ return "?"; } })();
-        p.url=uu.origin+(uu.pathname&&uu.pathname!=="/"?uu.pathname.replace(/\/+$/,""):"");
-        await store.savePanels(panelsAll);
         try{ await store.setCache("pub:dead:"+String(p.id),"",1); }catch{}
         try{ await store.pushLog({action:"diag_panelurl", detail:String(p.name||pid)+" :: "+oldHost+" -> "+uu.host, by:"diag", meta:null}); }catch{}
         let conn="ok";
@@ -20350,16 +20588,20 @@ export default {
         const tok=pj?String(pj.token||"").trim():"";
         const nu=pj?String(pj.url||"").trim():"";
         if(!pid||!tok) return deny("panelId and token required",400);
-        const panelsAll=await store.getPanels();
-        const p=(panelsAll||[]).find(x=>String(x.id)===String(pid));
+        // 🔒 f11: تغییر credential پنل از diag هم زیر قفل panels
+        // (URL بد مثل قبل قبل از هر تغییر رد می‌شود — هیچ‌چیز persist نمی‌شود)
+        let nu2=null;
+        if(nu){ try{ nu2=new URL(nu); }catch{ return deny("bad url",400); } }
+        let p=null;
+        await store.withLock("panels", 15, async()=>{
+          const panelsAll=await store.getPanels();
+          p=(panelsAll||[]).find(x=>String(x.id)===String(pid))||null;
+          if(!p) return;
+          p.token=tok;
+          if(nu2) p.url=nu2.origin+(nu2.pathname&&nu2.pathname!=="/"?nu2.pathname.replace(/\/+$/,""):"");
+          await store.savePanels(panelsAll);
+        });
         if(!p) return deny("panel not found",404);
-        const classic=/^[^:\s]+:[^:\s]+$/.test(tok);
-        p.token=tok;
-        if(nu){
-          let uu; try{ uu=new URL(nu); }catch{ return deny("bad url",400); }
-          p.url=uu.origin+(uu.pathname&&uu.pathname!=="/"?uu.pathname.replace(/\/+$/,""):"");
-        }
-        await store.savePanels(panelsAll);
         try{ await store.setCache("pub:dead:"+String(p.id),"",1); }catch{}
         let test="ok";
         try{ await new PanelApi(p.name,p.url,p.token,p.id).testConnection(); }
@@ -20630,7 +20872,15 @@ export default {
             _updClaim=String(update.update_id);
             _updClaimTok=(_cl&&_cl.t)||null;
           }
-        }catch(e){ console.error("claim block", e&&e.message); }
+        }catch(e){
+          // 🔴 f11 (گزارش — fail-closed): اگر خودِ claim غیرمنتظره throw شود،
+          //    ادامه‌دادن یعنی پردازشِ بدون claim ⇒ بازارسال تلگرام دوباره
+          //    اجرایش می‌کند (آپدیت‌ها idempotent نیستند). پس: پاک‌کردن
+          //    نشانگر حافظه + 503 تا تلگرام بعداً دوباره با claim سالم بفرستد.
+          console.error("claim block → 503", e&&e.message);
+          try{ if(update && update.update_id!=null && globalThis.__updSeen) globalThis.__updSeen.delete("u"+String(update.update_id)); }catch{}
+          return new Response("Temporarily unavailable",{status:503});
+        }
         const bot=new Bot(store,token,ctx);
         // /start and /start@BotName
         const msgText=(update.message&&update.message.text)||"";
