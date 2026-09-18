@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f11";
+const CODE_STAMP = "2026-09-19-f12";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -2579,6 +2579,19 @@ class Store {
    * @param {Function} fn بخش بحرانی
    * @param {number} [timeoutMs] حداکثر انتظار برای گرفتن قفل (پیش‌فرض ۸ ثانیه)
    */
+  /** f12: تمدید قفل — فقط اگر هنوز مالِ خودمان باشد (UPDATE WHERE value=?) */
+  async renewLock(key, token, sec) {
+    if(!this.db) return true; // حالت بدون D1: قفل حافظه‌ای رقیب واقعی ندارد
+    const k="lock:"+String(key);
+    try{
+      const res=await this.db.prepare("UPDATE store SET expires_at=? WHERE key=? AND value=?")
+        .bind(Date.now()+Math.max(5,Number(sec)||20)*1000, k, String(token)).run();
+      const changed=(res&&res.meta&&typeof res.meta.changes==="number")
+        ? res.meta.changes
+        : (res&&typeof res.changes==="number" ? res.changes : null);
+      return changed==null ? true : changed>0;
+    }catch(e){ console.error("renewLock d1", e&&e.message); return false; }
+  }
   async withLock(key, ttlSec, fn, timeoutMs) {
     const deadline=Date.now()+(Number(timeoutMs)||8000);
     let held=null;
@@ -2592,8 +2605,21 @@ class Store {
       err.code="LOCKED";
       throw err;
     }
+    // 💓 f12 (گزارش HIGH — withLock بدون تمدید): بخش بحرانی ممکن است از TTL
+    //    طولانی‌تر شود و قفل زیر پای fn بگذرد. هر ثلث TTL تمدید می‌کنیم؛ اگر
+    //    تمدید شکست بخورد (قطعی D1 یا قفلِ ربوده‌شده) دیگر تمدید نمی‌شود و
+    //    پنجرهٔ ریسک = مدت قطعی — همان حالت degraded که همه‌جا پذیرفته شده.
+    //    البته قاعدهٔ اصلی این است که داخل بخش بحرانی شبکه نباشد (پایین:
+    //    prune صف سه‌فازی شد).
+    const _ttl=Math.max(5,Number(ttlSec)||20);
+    const _iv=setInterval(()=>{
+      try{ this.renewLock(String(key), held, _ttl).catch(()=>{}); }catch{}
+    }, Math.max(2000, Math.floor(_ttl*1000/3)));
     try{ return await fn(); }
-    finally{ try{ await this.releaseLock(String(key), held); }catch{} }
+    finally{
+      try{ clearInterval(_iv); }catch{}
+      try{ await this.releaseLock(String(key), held); }catch{}
+    }
   }
   /**
    * f11: claim اتمیک برای «عملیات» (مثل ساخت کلاینت روی panel+email).
@@ -2619,9 +2645,13 @@ class Store {
       }catch(e){ console.error("claimOp d1", e&&e.message); return {s:"error"}; }
     }
     if(!globalThis.__opClaims) globalThis.__opClaims=new Map();
+    // 🔴 f12 (گزارش): fallback هم TTL واقعی دارد — ورودی منقضی دیگر «seen»
+    //    ابدی نیست؛ بعد از گذر ttlSec دوباره claim ممکن است.
     const ok="o"+String(opKey);
-    if(globalThis.__opClaims.has(ok)) return {s:"seen"};
-    globalThis.__opClaims.set(ok, Date.now());
+    const _prev=globalThis.__opClaims.get(ok);
+    const _now=Date.now();
+    if(_prev && Number(_prev.exp)>_now) return {s:"seen"};
+    globalThis.__opClaims.set(ok, {at:_now, exp:_now+(Number(ttlSec)||900)*1000});
     return {s:"claimed", t:null};
   }
   /** f11: آزادسازی claim عملیات — فقط با توکن مالکیت */
@@ -8158,41 +8188,70 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         await this.userCreateFromPlan(chat, 0, uid, planId, {silent:true});
       }catch(e){ console.error("pending cfg", e&&e.message); }
     }
-    // prune fulfilled — 🔒 f11: خواندن و نوشتن نهایی زیر قفل صف؛ بین خواندن
-    // و نوشتن فقط checkهای سبک می‌ماند (userFindActiveAccount شبکه دارد؛
-    // ریسک طول‌شدن قفل وجود ندارد چون فقط برای آیتم‌های باقی‌مانده چک می‌شود
-    // و TTL قفل ۳۰ ثانیه است؛ در بدترین حالت prune شکست می‌خورد و دور بعد
-    // تکرار می‌شود — ورودی‌ها پرت نمی‌شوند).
-    let left=[];
-    let pruned=0;
+    // 🔒 f12 (گزارش HIGH — قفل نباید روی شبکه بماند): prune سه‌فازی شد —
+    //   ۱) اسنپ‌شات زیر قفلِ کوتاه (فقط خواندن، بدون شبکه)؛
+    //   ۲) چک‌های userFindActiveAccount (شبکه) کاملاً بیرون قفل؛
+    //   ۳) نوشتن زیر قفلِ کوتاه روی «تازه‌ترین» لیست و فقط برای uidهایی که
+    //      در اسنپ‌شات بودند ⇒ enqueue همزمان هرگز پرت نمی‌شود و TTL قفل
+    //      هیچ وابستگی به شبکه ندارد. شکست هر فاز = عدم تغییر صف (امن).
+    let decisions=null;
     try{
-      await this.store.withLock("pending_cfgs", 30, async()=>{
-        const raw2=await this.store.get(KEYS.PENDING_CFGS);
-        const cur=raw2?JSON.parse(raw2):[];
-        left=[];
-        for(const item of (Array.isArray(cur)?cur:[])){
-          if(item && item.type==="migrate" && item.snapshot){
-            const snap=item.snapshot||{};
-            // snapshot تاریخ‌گذشته را در صف نگه ندار؛ ساخت اکانت تاریخ‌گذشته ممنوع است.
-            if(!((Number(snap.expiryTime)||0)>Date.now() && (Number(snap.remainingBytes)||0)>0)){ pruned++; continue; }
+      await this.store.withLock("pending_cfgs", 10, async()=>{
+        const rawS=await this.store.get(KEYS.PENDING_CFGS);
+        let arr=[]; try{ arr=rawS?JSON.parse(rawS):[]; }catch{}
+        decisions=new Map();
+        for(const it0 of (Array.isArray(arr)?arr:[])){
+          if(!it0) continue;
+          const uid0=String(it0.uid);
+          if(decisions.has(uid0)) continue;
+          let drop0=false;
+          if(it0.type==="migrate" && it0.snapshot){
+            const s0=it0.snapshot||{};
+            // منقضیِ محلی — بدون شبکه همینجا حذف‌شدنی است
+            if(!((Number(s0.expiryTime)||0)>Date.now() && (Number(s0.remainingBytes)||0)>0)) drop0=true;
           }
-          const active=await this.userFindActiveAccount(item.uid,{publicOnly:false});
-          if(!(active&&active.reachable&&active.client&&!active.expired)) left.push(item);
-          else pruned++;
+          decisions.set(uid0, {drop:drop0});
         }
-        await this.store.put(KEYS.PENDING_CFGS, JSON.stringify(left));
-      }, 25000);
-    }catch{
-      // قفل نشد ⇒ دست به صف نمی‌زنیم (هیچ‌چیز گم نمی‌شود؛ دور بعد تلاش می‌شود)
-      left=null;
+      }, 6000);
+    }catch{ decisions=null; }
+    if(decisions){
+      // فاز ۲: شبکه بیرون قفل
+      for(const [uid1, d1] of decisions){
+        if(d1.drop) continue;
+        try{
+          const active1=await this.userFindActiveAccount(uid1,{publicOnly:false});
+          if(active1&&active1.reachable&&active1.client&&!active1.expired) d1.drop=true;
+        }catch{}
+      }
+      // فاز ۳: نوشتن زیر قفل کوتاه
+      try{
+        await this.store.withLock("pending_cfgs", 10, async()=>{
+          const raw2=await this.store.get(KEYS.PENDING_CFGS);
+          let cur=[]; try{ cur=raw2?JSON.parse(raw2):[]; }catch{}
+          const left=[];
+          for(const item of (Array.isArray(cur)?cur:[])){
+            if(!item) continue;
+            const d2=decisions.get(String(item.uid));
+            if(d2 && d2.drop) continue;
+            if(item.type==="migrate" && item.snapshot){
+              const snap=item.snapshot||{};
+              // snapshot تاریخ‌گذشته را در صف نگه ندار؛ ساخت اکانت تاریخ‌گذشته ممنوع است.
+              if(!((Number(snap.expiryTime)||0)>Date.now() && (Number(snap.remainingBytes)||0)>0)) continue;
+            }
+            left.push(item);
+          }
+          await this.store.put(KEYS.PENDING_CFGS, JSON.stringify(left));
+        }, 6000);
+      }catch{}
     }
-    if(left==null){
-      const raw3=await this.store.get(KEYS.PENDING_CFGS).catch(()=>null);
-      let cur=[]; try{ cur=raw3?JSON.parse(raw3):[]; }catch{}
-      left=(Array.isArray(cur)?cur:[]);
-      pruned=0;
-    }
-    return (list.length-left.length);
+    // شمارش برای پیام نهایی از روی وضعیت فعلی صف
+    let leftN=0;
+    try{
+      const raw3=await this.store.get(KEYS.PENDING_CFGS);
+      let cur3=[]; try{ cur3=raw3?JSON.parse(raw3):[]; }catch{}
+      leftN=(Array.isArray(cur3)?cur3:[]).length;
+    }catch{}
+    return Math.max(0, list.length-leftN);
   }
 
   /**
@@ -8463,13 +8522,36 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           //    ۱۵ دقیقه به‌عنوان نشانهٔ «ساخته شد/در حال ساخت» می‌ماند.
           const _opKey="add:"+String(_best&&_best.id)+":"+String(_email);
           const _op=await this.store.claimOp(_opKey, 900);
-          if(_op.s!=="claimed"){
-            throw new Error("CREATE_IN_PROGRESS: این کانفیگ همین حالا ساخته می‌شود یا ثبت اتمیک ساخت ممکن نشد؛ چند لحظه بعد دوباره تلاش کنید. ("+_op.s+")");
+          if(_op.s==="error"){
+            // fail-closed: تکلیف claim مشخص نشد ⇒ بدون ساخت ادامه نده
+            throw new Error("CREATE_CLAIM_ERROR: خطای ذخیره‌ساز در ثبت اتمیک ساخت؛ چند لحظه بعد دوباره تلاش کنید.");
           }
-          const _opTok=_op.t;
-          try{ await _api.deleteClient(_email); }catch{}
+          if(_op.s==="seen"){
+            // 🔴 f12 (گزارش): claim مانده ≠ حتماً «همین حالا در حال ساخت» —
+            //    شاید اجرای قبلی بعد از addClientِ موفق در قدم دیگری خطا خورده.
+            //    پس اول واقعیتِ پنل: کلاینت معتبر موجود ⇒ مسیر «از قبل موجود»
+            //    (بدون add/delete)؛ فقط اگر واقعاً نبود پیام CREATE_IN_PROGRESS.
+            let _existsNow=false;
+            try{
+              const preX=await _api.getClient(_email);
+              const preXo=(preX&&preX.obj)||preX||{};
+              const preXc=preXo.client||preXo||{};
+              if(preXc && (preXc.email||preXo.email)){
+                const preXe=Number(preXc.expiryTime||0)||0;
+                if(preXe>Date.now() || (!preXe && preXc.enable!==false)) _existsNow=true;
+              }
+            }catch{}
+            if(!_existsNow){
+              throw new Error("CREATE_IN_PROGRESS: این کانفیگ همین حالا ساخته می‌شود؛ چند لحظه بعد دوباره تلاش کنید.");
+            }
+            alreadyExists=true;
+          }
+          const _opTok=(_op&&_op.t)||null;
+          if(_opTok){
+            try{ await _api.deleteClient(_email); }catch{}
+          }
           try{
-            await _api.addClient(_email, _totalBytes, _expiryMs, 0, _inboundIds, {tgId: uid, comment: "tg:"+uid});
+            if(_opTok) await _api.addClient(_email, _totalBytes, _expiryMs, 0, _inboundIds, {tgId: uid, comment: "tg:"+uid});
           }catch(e){
             lastErr=(e&&e.message)?e.message:String(e);
             // Client may already exist (race). Re-check; do NOT overwrite quota if still valid.
@@ -8495,13 +8577,13 @@ if(active && active.reachable && active.client && !active.expired && !active.not
                 }catch(e2){
                   lastErr=(e2&&e2.message)||lastErr||"create failed";
                   // 🔴 f11: ساخت کامل نشد ⇒ claim آزاد شود تا تلاش دوباره ممکن باشد
-                  try{ await this.store.releaseOp("add:"+String(_best&&_best.id)+":"+String(_email), _opTok); }catch{}
+                  if(_opTok){ try{ await this.store.releaseOp("add:"+String(_best&&_best.id)+":"+String(_email), _opTok); }catch{} }
                   throw new Error(lastErr);
                 }
               }
             }catch(e3){
               // 🔴 f11: همینطور اینجا
-              try{ await this.store.releaseOp("add:"+String(_best&&_best.id)+":"+String(_email), _opTok); }catch{}
+              if(_opTok){ try{ await this.store.releaseOp("add:"+String(_best&&_best.id)+":"+String(_email), _opTok); }catch{} }
               if(lastErr) throw new Error(lastErr);
               throw e3;
             }
@@ -15704,18 +15786,21 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     if(!state||!state.data||state.data.pid==null) return;
     const pid=state.data.pid;
     const num=parseFloat(String(text).replace(",","."))||0;
-    // 🔒 f11: read-modify-write پنل‌ها زیر قفل توزیع‌شده
+    // 🔒 f11 + 🔴 f12 fix: خروجی‌های بعد از قفل بیرون callback جمع می‌شوند
+    let pName=""; let found=false;
     await this.store.withLock("panels", 15, async()=>{
       const panels=await this.store.getPanels();
       const p=panels.find(x=>String(x.id)===String(pid));
       if(!p) return;
       p.trafficLimitGB=num>0?num:null;
       await this.store.savePanels(panels);
+      pName=p.name; found=true;
     });
+    if(!found){ await this.store.clearState(uid); return; }
     await this.store.clearState(uid);
     const lang=await this.lang();
     await this.tg.msg(chat,
-      L(lang,"✅ سقف ترافیک *","✅ Traffic cap *")+esc(p.name)+"* = *"+(num>0?(num+" GB"):L(lang,"نامحدود","Unlimited"))+"*",
+      L(lang,"✅ سقف ترافیک *","✅ Traffic cap *")+esc(pName)+"* = *"+(num>0?(num+" GB"):L(lang,"نامحدود","Unlimited"))+"*",
       {reply_markup:(await this.panelsMenu())}
     );
   }
@@ -15817,6 +15902,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     }
     // 🔒 f11: ساخت پنل زیر قفل — newId هم داخل قفل محاسبه می‌شود تا دو
     // پنل همزمان id یکسان نگیرند و آرایه هم lost update نشود.
+    // 🔴 f12 fix: newId بعد از قفل لازم است (PanelApi/askPanelCategory) ⇒
+    // بیرون callback جمع می‌شود.
+    let newIdOut=null;
     await this.store.withLock("panels", 15, async()=>{
       const panels=await this.store.getPanels();
       const newId=panels.length?Math.max(...panels.map(p=>p.id))+1:1;
@@ -15830,8 +15918,10 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         expiryDate: expiryDate
       });
       await this.store.savePanels(panels);
+      newIdOut=newId;
     });
     await this.store.clearState(uid);
+    if(newIdOut==null){ return this.tg.msg(chat,"❌ Panel create failed."); }
     // ℹ️ پنل تازه در *هیچ* دسته‌ای نیست: نه در publicPanelIds ثبت می‌شود
     //    و نه جایی به‌عنوان «عمومی» علامت می‌خورد. انتخاب با ادمین است.
     await this.tg.msg(chat,"🔌 Probing *"+esc(name)+"*..."+expiryNote);
@@ -16016,16 +16106,19 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const nm=String(name||"").trim();
     if(!nm) return this.tg.msg(chat,L(lang,"نام خالی نباشد.","Name cannot be empty."));
     // 🔒 f11: read-modify-write پنل‌ها زیر قفل توزیع‌شده
-    let renamed="";
+    // 🔴 f12 fix: خروجی‌هایی که بعد از قفل لازم‌اند باید بیرون callback
+    //    جمع شوند — «p?p.id» بعد از withLock دیگر در scope نیست (باگ
+    //    runtime واقعی f11: ReferenceError بعد از rename).
+    let renamed=""; let panelId="";
     await this.store.withLock("panels", 15, async()=>{
       const panels=await this.store.getPanels();
       const p=panels.find(x=>String(x.id)===String(state&&state.data&&state.data.pid));
-      if(p){ p.name=nm; await this.store.savePanels(panels); renamed=p.name; }
+      if(p){ p.name=nm; await this.store.savePanels(panels); renamed=p.name; panelId=String(p.id); }
     });
     await this.store.clearState(uid);
     try{ await this.addLog("panel_rename", (renamed||"") , uid); }catch{}
     await this.tg.msg(chat,L(lang,"✅ نام پنل شد: *","✅ Panel name is now: *")+esc(nm)+"*",
-      {reply_markup:kb([[btn(L(lang,"✏ ادامه ویرایش","✏ Keep editing"),"sel_edit:"+(p?p.id:"")), btn(L(lang,"◀ پنل‌ها","◀ Panels"),"m:panels")]])});
+      {reply_markup:kb([[btn(L(lang,"✏ ادامه ویرایش","✏ Keep editing"),"sel_edit:"+panelId), btn(L(lang,"◀ پنل‌ها","◀ Panels"),"m:panels")]])});
   }
   async onEditPanelUrlStart(chat,mid,pid) {
     const lang=await this.lang();
