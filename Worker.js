@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f13";
+const CODE_STAMP = "2026-09-19-f14";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -2237,6 +2237,8 @@ class Store {
         const m=await this._d1GetRaw("__migrated_from_kv");
         markerMissing=(m==null);
       }catch(e){ console.error("D1 migrate-check", e&&e.message); markerMissing=true; }
+      // 🔴 f14: وضعیت مهاجرت برای گیتِ KV-fallback در get()
+      if(!markerMissing){ this._migrated=true; }
       if(markerMissing && this.kv){
         const keys = Object.values(KEYS);
         let failed=0;
@@ -2257,9 +2259,18 @@ class Store {
         if(!failed){
           try{ await this._d1PutRaw("__migrated_from_kv", "1", null); }
           catch(e){ console.error("migrate marker", e&&e.message); }
+          // مهاجرت کامل شد ⇒ از این لحظه در همین isolate هم KV خوانده نمی‌شود
+          this._migrated=true;
         } else {
           console.error("KV→D1 migration incomplete:", failed, "key(s) failed — will retry next boot");
+          // ❗ فلگ false می‌ماند ⇒ تا کامل‌شدن مهاجرت، KV برای کلیدهای
+          //    ناموجود در D1 همچنان مجاز است (در دسترس‌بودن مقدم بر سخت‌گیری
         }
+      }
+      if(markerMissing && !this.kv){
+        // بدون KV چیزی برای مهاجرت نیست ⇒ همین حالا مهر بزن
+        try{ await this._d1PutRaw("__migrated_from_kv", "1", null); }catch{}
+        this._migrated=true;
       }
       return true;
     }catch(e){
@@ -2344,8 +2355,14 @@ class Store {
       // خطای D1 اینجا throw می‌شود (نه سقوط به دادهٔ منجمدِ KV)
       const v = await this._d1GetRaw(k);
       if(v!=null) return v;
-      // فقط «کلید در D1 نیست» ⇒ شاید هنوز مهاجرت نکرده
-      if(this.kv){
+      // 🔴 f14 (گزارش HIGH — resurrect از KV): «کلید در D1 نیست» فقط وقتی
+      //    یعنی «واقعاً وجود ندارد» که مهاجرت کامل شده باشد. قبلاً بی‌قید
+      //    به KV سقوط می‌کردیم و دادهٔ حذف‌شده/منقضی‌شده از KVِ یخ‌زده
+      //    زنده می‌شد (BOT_USERS حذف‌شده، DIAG_TOKEN ابطال‌شده، رکورد
+      //    منقضی و...). حالا KV فقط تا وقتی نشانگر مهاجرت ثبت نشده
+      //    خوانده می‌شود؛ بعد از آن D1 تک‌منبع حقیقت است — نبودن کلید
+      //    یعنی نبودن. (حذفِ KV هم دیگر بی‌اثر شده؛ فقط بهداشتی است.)
+      if(this.kv && this._migrated!==true){
         try{ return await this.kv.get(k,{type:"text"}); }catch{ return null; }
       }
       return null;
@@ -2409,6 +2426,8 @@ class Store {
   async del(k, strict) {
     await this.ready();
     if(this.db) await this._d1DelRaw(k, strict===true);
+    // 🔴 f14: حذف KV بی‌صدا می‌ماند ولی دیگر خطرناک نیست — بعد از مهاجرت
+    //    get() اصلاً KV را نمی‌خواند (گیتِ _migrated)، پس «زنده‌شدن» ممکن نیست.
     if(this.kv){ try{ await this.kv.delete(k); }catch{} }
   }
 
@@ -2493,7 +2512,9 @@ class Store {
     let v=await this.get(KEYS.ADMIN_KEY);
     if(typeof v==="string" && v.length>=16) return v;
     v=randId(40);
-    try{ await this.put(KEYS.ADMIN_KEY, v); }catch{}
+    // 🔴 f14 (گزارش MEDIUM): مثل WEBHOOK_SECRET — تا persist موفق نشود این
+    //    کلید «معتبر» نیست؛ بلعیدن خطا یعنی هر درخواست کلیدِ متفاوت می‌ساخت.
+    await this.put(KEYS.ADMIN_KEY, v);
     return v;
   }
   async getPanels() { const r=await this.get(KEYS.PANELS); if(!r) return []; try{ const v=typeof r==="object"?r:JSON.parse(r); return Array.isArray(v)?v:[]; }catch{ return []; } }
@@ -2981,14 +3002,19 @@ class Store {
   }
   async savePublicTrafficLedger(m) { await this.put("cfg:pub_traffic", m); }
   async addDeletedPublicTraffic(panelId, bytes) {
-    const m=await this.getPublicTrafficLedger();
-    const id=String(panelId);
-    const prev=m[id]||{deletedBytes:0, updatedAt:0};
-    prev.deletedBytes=(Number(prev.deletedBytes)||0)+Math.max(0, Number(bytes)||0);
-    prev.updatedAt=Date.now();
-    m[id]=prev;
-    await this.savePublicTrafficLedger(m);
-    return prev.deletedBytes;
+    // 🔴 f14 (گزارش MEDIUM — RMW در لجر ترافیک عمومی): هر ۷ صداکننده از
+    //    همین متد عبور می‌کنند ⇒ یک قفل کافی است؛ افزایش همزمان‌ها دیگر
+    //    گم نمی‌شود (100+50 و 100+30 ⇒ 180 نه 130).
+    return this.withLock("pub_traffic", 10, async()=>{
+      const m=await this.getPublicTrafficLedger();
+      const id=String(panelId);
+      const prev=m[id]||{deletedBytes:0, updatedAt:0};
+      prev.deletedBytes=(Number(prev.deletedBytes)||0)+Math.max(0, Number(bytes)||0);
+      prev.updatedAt=Date.now();
+      m[id]=prev;
+      await this.savePublicTrafficLedger(m);
+      return prev.deletedBytes;
+    });
   }
   async getPublicCfg() {
     // 💡 بهینه‌سازی D1 (d51): کش کوتاه‌عمرِ per-isolate (۱۵ ثانیه).
