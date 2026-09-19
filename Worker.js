@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f16";
+const CODE_STAMP = "2026-09-19-f17";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -16125,6 +16125,11 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     });
     await this.store.clearState(uid);
     if(newIdOut==null){ return this.tg.msg(chat,"❌ Panel create failed."); }
+    // 🔴 f17 fix (باگ runtime وارده در f11/f12 — گزارش میدانی: «ReferenceError:
+    //    newId is not defined» هنگام افزودن پنل): ارجاع‌های بعد از قفل
+    //    (PanelApi/askPanelCategory) به newId داخلِ callback بودند. alias
+    //    سراسری ⇒ همهٔ ارجاع‌های پایین‌دست سالم‌اند.
+    const newId=newIdOut;
     // ℹ️ پنل تازه در *هیچ* دسته‌ای نیست: نه در publicPanelIds ثبت می‌شود
     //    و نه جایی به‌عنوان «عمومی» علامت می‌خورد. انتخاب با ادمین است.
     await this.tg.msg(chat,"🔌 Probing *"+esc(name)+"*..."+expiryNote);
