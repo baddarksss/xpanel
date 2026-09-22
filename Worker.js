@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f21";
+const CODE_STAMP = "2026-09-19-f22";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -245,7 +245,7 @@ const LANG = {
     add_admin: "➕ اضافه کردن ادمین",
     remove_admin: "➖ حذف ادمین",
     list_admins: "📋 لیست ادمین‌ها",
-    send_admin_id: "🆔 آیدی تلگرام ادمین جدید را وارد کنید:",
+    send_admin_id: "🆔 آیدی عددی تلگرام یا @یوزرنیمِ ادمین جدید را بفرست:",
     admin_added: "✅ ادمین اضافه شد!",
     admin_removed: "✅ ادمین حذف شد!",
     language: "🌐 زبان",
@@ -449,7 +449,7 @@ const LANG = {
     add_admin: "➕ Add Admin",
     remove_admin: "➖ Remove Admin",
     list_admins: "📋 Admin List",
-    send_admin_id: "🆔 Enter new admin Telegram ID:",
+    send_admin_id: "🆔 Send the new admin's numeric Telegram ID or @username:",
     admin_added: "✅ Admin added!",
     admin_removed: "✅ Admin removed!",
     language: "🌐 Language",
@@ -14177,22 +14177,57 @@ if(active && active.reachable && active.client && !active.expired && !active.not
 
   async onAddAdminId(chat,uid,adminId) {
     const lang=await this.lang();
-    if(!/^\d+$/.test(adminId)){await this.store.clearState(uid);return this.tg.msg(chat,"❌ Invalid ID");}
+    // 🆕 f22: علاوه بر آیدی عددی، @یوزرنیم هم قبول می‌شود. بات تلگرام راه مستقیم
+    //    برای یوزرنیم→آیدی ندارد؛ ترجمه از دیتابیس کاربران ربات (bot_users) —
+    //    یعنی کاربر باید حداقل یک‌بار ربات را استارت کرده باشد.
+    let raw=String(adminId||"").trim();
+    if(raw.startsWith("@")) raw=raw.slice(1);
+    let target=raw;
+    let viaName=null;
+    if(/^\d+$/.test(target)){
+      target=String(parseInt(target,10));
+    } else if(/^[A-Za-z0-9_]{4,32}$/.test(target)){
+      let resolved=null;
+      try{
+        const users=await this.store.getBotUsers();
+        const low=target.toLowerCase();
+        for(const id of Object.keys(users||{})){
+          const u=users[id];
+          if(u && String(u.username||"").toLowerCase()===low){ resolved=String(id); break; }
+        }
+      }catch{}
+      if(!resolved){
+        await this.store.clearState(uid);
+        return this.tg.msg(chat,
+          L(lang,"❌ این یوزرنیم در دیتابیس ربات پیدا نشد.\nکاربر باید یک‌بار ربات را استارت کرده باشد.","❌ Username not found in the bot database.\nThe user must have started the bot at least once."),
+          {reply_markup:(await this.backMain())});
+      }
+      target=resolved; viaName=raw;
+    } else {
+      await this.store.clearState(uid);
+      return this.tg.msg(chat,
+        L(lang,"❌ فرمت درست نیست؛ آیدی عددی یا @یوزرنیم بفرست.","❌ Invalid format; send a numeric ID or @username."),
+        {reply_markup:(await this.backMain())});
+    }
     // 🔒 f15: خواندن-بررسی-افزودن همه زیر قفل (دو افزودن همزمان هر دو save شوند)
     let added=false;
     await this.store.withLock("admins", 10, async()=>{
       const admins=await this.store.getAdmins();
-      if(admins.includes(adminId)||(await this.ownerId())===adminId) return;
-      admins.push(adminId);
+      if(admins.includes(target)||(await this.ownerId())===target) return;
+      admins.push(target);
       await this.store.saveAdmins(admins);
       added=true;
     });
     if(!added){
       await this.store.clearState(uid);
-      return this.tg.msg(chat,"❌ Already admin");
+      return this.tg.msg(chat,
+        (viaName?("@"+viaName+" → `"+target+"`\n"):"")+"❌ Already admin",
+        {reply_markup:(await this.backMain())});
     }
     await this.store.clearState(uid);
-    await this.tg.msg(chat,t(lang,"admin_added")+" `"+adminId+"`",{reply_markup:(await this.backMain())});
+    await this.tg.msg(chat,
+      t(lang,"admin_added")+" `"+target+"`"+(viaName?("  (@"+viaName+")"):""),
+      {reply_markup:(await this.backMain())});
   }
 
   // ---- Edit Panel Token ----
