@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f17";
+const CODE_STAMP = "2026-09-19-f21";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -4080,6 +4080,21 @@ class PanelApi {
   async getInbounds() { const r=await this.req("/inbounds/list"); return Array.isArray(r.obj)?r.obj:[]; }
 
   // GET /panel/api/clients/traffic/{email}
+  /**
+   * f19: مجموع ترافیک کل پنل از روی inboundها — دقیقاً همان عددی که
+   * داشبورد x-ui نشان می‌دهد (sum(up+down) همهٔ inboundها). برای
+   * خودهم‌ترازی دفتر ظرفیت با واقعیتِ پنل. برای پنل‌های غیرکلاسیک null.
+   */
+  async inboundsTrafficTotal() {
+    try{
+      const r=await this.req("/inbounds/list");
+      let sum=0;
+      for(const inb of ((r&&r.obj)||[])){
+        sum += (Number(inb&&inb.up)||0) + (Number(inb&&inb.down)||0);
+      }
+      return sum;
+    }catch{ return null; }
+  }
   async getTraffic(email) {
     if(this.classic){
       try{
@@ -5018,7 +5033,23 @@ class Bot {
     }
     if(d==="sup:cancel"){
       try{ await this.store.clearState(String(uid)); }catch{}
+      // 🔴 f21: لغو = حذف پیامِ پیش‌نویس؛ کارت اصلی کاربر زیرش می‌ماند
+      try{
+        const r=await this.tg.call("deleteMessage",{chat_id:chat, message_id:mid});
+        if(r&&r.ok) return;
+      }catch{}
       return this.editOrSend(chat,mid,L(lang,"❌ پاسخ لغو شد.","❌ Reply cancelled."),kb([[btn(L(lang,"🏠 منو","🏠 Menu"),"m:main")]]));
+    }
+    // 🔴 f21 (درخواست میدانی): «بازگشت» از نمای مشخصات = حذف همان پیامِ نما؛
+    //    کارتِ اصلیِ پیام کاربر سر جایش در چت می‌ماند (دسترسی همیشگی).
+    if(d==="sup:close"){
+      try{
+        const r=await this.tg.call("deleteMessage",{chat_id:chat, message_id:mid});
+        if(!(r&&r.ok)) throw new Error((r&&r.description)||"delete failed");
+      }catch{
+        try{ await this.editOrSend(chat,mid,"⌫",kb([[btn(L(lang,"🏠 منو","🏠 Menu"),"m:main")]])); }catch{}
+      }
+      return;
     }
     if(d.startsWith("sup:card:")) return this.supportUserCard(chat,mid,d.substring(9));
     if(d.startsWith("sup:reply:")) return this.supportReplyStart(chat,mid,uid,d.substring(10));
@@ -7060,8 +7091,9 @@ class Bot {
     // ═══════════════════════════════════════════════════════════
     let realUsed = 0;      // مصرف قطعی و برگشت‌ناپذیر
     let openCommit = 0;    // حجمی که هنوز ممکن است مصرف شود
+    let api = null;        // 🔴 f20b: بیرون try — پایین‌تر (کالیبراسیون) لازم است
     try {
-      const api = new PanelApi(panel.name, panel.url, panel.token, panel.id);
+      api = new PanelApi(panel.name, panel.url, panel.token, panel.id);
       const cs = await api.getClients();
       const now = Date.now();
       for (const c of (cs || [])) {
@@ -7090,6 +7122,30 @@ class Bot {
       const ledger = await this.store.getPublicTrafficLedger();
       deleted = Number((ledger[String(panel.id)] || {}).deletedBytes) || 0;
     } catch {}
+
+    // 🩹 f19 (گزارش میدانی: «پنل ۴۳ گیگ نشان می‌دهد ولی ربات ۹۹٪»): دفتر
+    //    حذف‌شده‌ها فقط **افزودنی** است و هیچ‌وقع چک‌وشو با واقعیت پنل
+    //    ندارد — اگر پنل ریست/نصب مجدد شده باشد (کانترهای x-ui صفر شده)
+    //    یا کلاینتی دوباره‌ساخته و دوباره پاک شده باشد، دفتر باد می‌کند و
+    //    پنلِ نیمه‌خالی «پر» دیده می‌شد (x28: ربات 74GB، پنل 43GB!).
+    //    حالا: مجموع ترافیک inboundها (= عدد داشبورد پنل) خوانده می‌شود؛
+    //    سهم حذف‌شده‌ها = همان عدد منهای مصرف زنده‌های فعلی. اختلاف معنادار
+    //    (>۰٫۵GB) ⇒ دفتر هم اصلاح می‌شود تا همهٔ نماها هم‌نظر شوند.
+    try{
+      if(!api) throw new Error("no api");
+      const pt=await api.inboundsTrafficTotal();
+      if(pt!=null && pt>=0){
+        const inferred=Math.max(0, pt - realUsed);
+        if(Math.abs(inferred - deleted) > 512*1024*1024){
+          await this.store.withLock("pub_traffic", 10, async()=>{
+            const m=await this.store.getPublicTrafficLedger();
+            m[String(panel.id)]={ deletedBytes: inferred, updatedAt: Date.now(), calibratedAt: new Date().toISOString() };
+            await this.store.savePublicTrafficLedger(m);
+          }, 6000);
+          deleted=inferred;
+        }
+      }
+    }catch{}
 
     // حجم رزروشدهٔ درخواست‌های در جریان (جلوگیری از ساخت همزمان بیش از ظرفیت)
     let reserved = 0;
@@ -9186,19 +9242,26 @@ if(active && active.reachable && active.client && !active.expired && !active.not
    * اگر کانفیگ فعال داشته باشد، مستقیم صفحهٔ مشخصات کانفیگ باز می‌شود.
    */
   async supportUserCard(chat, mid, targetUid) {
+    // 🔴 f21 (درخواست میدانی — «کادر پیام بمونه»): مشخصات دیگر روی کارتِ
+    //    پیام کاربر edit نمی‌شود؛ به‌صورت پیام *تازه* باز می‌شود و دکمهٔ
+    //    «بازگشت» همان پیامِ نما را حذف می‌کند تا کارت اصلی زیرش پیدا شود.
+    //    (mid عمداً نادیده گرفته می‌شود.)
     const lang=await this.lang();
     const uid=String(targetUid||"").trim();
-    if(!uid) return this.editOrSend(chat,mid,L(lang,"❌ شناسه نامعتبر.","❌ Invalid id."),kb([[btn("◀","m:main")]]));
+    if(!uid) return this.tg.msg(chat,L(lang,"❌ شناسه نامعتبر.","❌ Invalid id."),{reply_markup:kb([[btn("◀","m:main")]])});
     let u=null;
     try{ u=(await this.store.getBotUsers())[uid]||null; }catch{}
     if(!u){
-      return this.editOrSend(chat,mid,
+      return this.tg.msg(chat,
         L(lang,"❌ این کاربر در دیتابیس ربات نیست.\n🆔 `","❌ User not in bot database.\n🆔 `")+uid+"`",
-        kb([[btn(L(lang,"✉️ پاسخ","✉️ Reply"),"sup:reply:"+uid)],[btn(L(lang,"🏠 منو","🏠 Menu"),"m:main")]]));
+        {reply_markup:kb([
+          [btn(L(lang,"✉️ پاسخ","✉️ Reply"),"sup:reply:"+uid)],
+          [btn(L(lang,"↩️ بازگشت به پیام","↩️ Back to message"),"sup:close")],
+        ])});
     }
-    // اگر کانفیگ فعال دارد، یک‌راست همان صفحه‌ای که خواسته شد باز شود
+    // اگر کانفیگ فعال دارد، یک‌راست همان صفحه — ولی به‌صورت پیام تازه
     if(u.email && u.panelId!=null){
-      return this.showClientDetails(chat, mid, u.panelId, u.email, "sup:card:"+uid);
+      return this.showClientDetails(chat, null, u.panelId, u.email, "sup:close");
     }
     // کانفیگ ندارد → کارت اطلاعات
     const nm=[(u.firstName||""),(u.lastName||"")].join(" ").trim();
@@ -9219,10 +9282,10 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     if(u.banned) lines.push("\n🚫 *"+L(lang,"مسدود","Banned")+"*");
     lines.push("");
     lines.push(L(lang,"_کانفیگ فعالی ندارد._","_No active config._"));
-    return this.editOrSend(chat,mid,lines.join("\n"),kb([
+    return this.tg.msg(chat,lines.join("\n"),{reply_markup:kb([
       [btn(L(lang,"✉️ پاسخ به کاربر","✉️ Reply"),"sup:reply:"+uid)],
-      [btn(L(lang,"🏠 منو","🏠 Menu"),"m:main")],
-    ]));
+      [btn(L(lang,"↩️ بازگشت به پیام","↩️ Back to message"),"sup:close")],
+    ])});
   }
 
   async supportReplyStart(chat,mid,adminUid,targetUid) {
@@ -9232,22 +9295,12 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       L(lang,"متن یا عکس بفرستید — هر چند تا که خواستید.\nهیچ‌کدام فوری ارسال نمی‌شود؛ آخرش دکمهٔ *تأیید و ارسال* را بزنید.",
              "Send text or photos — as many as you like.\nNothing is sent until you press *Confirm & send*.");
     const markup=kb([[btn(L(lang,"❌ لغو","❌ Cancel"),"sup:cancel")]]);
-    let draftMid=Number(mid||0)||0;
-    let shown=false;
-    if(draftMid){
-      const r=await this.tg.edit(chat,draftMid,text,{reply_markup:markup});
-      const desc=String((r&&r.description)||"");
-      if(r&&r.ok) shown=true;
-      else if(/not modified/i.test(desc)) shown=true;
-    }
-    // اگر دکمهٔ پاسخ روی پیام رسانه بوده باشد، editMessageText ممکن است جواب ندهد؛
-    // در این حالت پیام راهنمای تازه ساخته می‌شود و ID همان پیام تازه به‌عنوان draftMid ذخیره می‌شود
-    // تا بعد از افزودن متن/عکس و سپس تأیید، همان پیام ویرایش شود و گزینهٔ قدیمی باقی نماند.
-    if(!shown){
-      const sent=await this.tg.msg(chat,text,{reply_markup:markup});
-      const nid=sent&&sent.result&&sent.result.message_id;
-      if(nid){ draftMid=Number(nid)||0; shown=true; }
-    }
+    // 🔴 f21: پیش‌نویسِ پاسخ همیشه پیام تازه است — کارتِ پیام کاربر
+    //    دست‌نخورده در چت می‌ماند؛ لغو/ارسال فقط همین پیامِ نما را عوض می‌کند.
+    let draftMid=0;
+    const sent=await this.tg.msg(chat,text,{reply_markup:markup});
+    const nid=sent&&sent.result&&sent.result.message_id;
+    if(nid){ draftMid=Number(nid)||0; }
     try{
       await this.store.setState(String(adminUid),"admin_reply",{targetUid:String(targetUid), draftMid});
     }catch(e){
@@ -20880,6 +20933,108 @@ export default {
         catch(e){ conn=String((e&&e.message)||e).slice(0,140); }
         return new Response(JSON.stringify({ok:true,panelId:pid,name:p.name||"",hostOld:oldHost,hostNew:uu.host,pathNew:(uu.pathname&&uu.pathname!=="/")?uu.pathname:"",test:conn}),{status:200,headers:{"Content-Type":"application/json; charset=utf-8",...secHeaders}});
       }catch(e){ return deny(String(e&&e.message||e).slice(0,200),500); }
+    }
+
+    // 🩹 f20: کالیبرهٔ دستی دفتر ظرفیت پنل — وقتی داشبورد پنل عددی متفاوت با
+    //    دفتر ربات نشان می‌دهد (ریست/نصب مجدد پنل)، Owner مقدار واقعی را می‌دهد:
+    //    POST /diag/calibrate  body: {"panelId":"42","usedGB":43}
+    //    سهم حذف‌شده‌ها = usedGB واقعی منهای مصرف زنده‌های فعلی.
+    if(url.pathname==="/diag/calibrate"&&request.method==="POST"){
+      const secHeaders={"Cache-Control":"no-store, no-cache, must-revalidate, private","X-Robots-Tag":"noindex, nofollow, noarchive","X-Content-Type-Options":"nosniff"};
+      const deny=(msg,code)=>new Response(JSON.stringify({ok:false,error:msg}),{status:code,headers:{"Content-Type":"application/json",...secHeaders}});
+      try{
+        if(!(await store.isInstalled())) return deny("not installed",400);
+        const given=request.headers.get("X-Diag-Token")||"";
+        const rec=await store.getDiagToken();
+        await new Promise(r=>setTimeout(r,300));
+        if(!rec || !given || !timingSafeEq(given, rec.token)) return deny("Unauthorized or expired diag token",401);
+        if(!rec.allowDeploy) return deny("read-only token",403);
+        const pj=await request.json().catch(()=>null);
+        const pid=pj?String(pj.panelId||""):"";
+        const usedGB= pj?Number(pj.usedGB):NaN;
+        if(!pid || !Number.isFinite(usedGB) || usedGB<0) return deny("panelId and usedGB required",400);
+        const panels=await store.getPanels();
+        const panel=(panels||[]).find(x=>String(x.id)===String(pid));
+        if(!panel) return deny("panel not found",404);
+        const api=new PanelApi(panel.name,panel.url,panel.token,panel.id);
+        let cs=[];
+        try{ cs=await api.getClients(); }catch(e){ return deny("getClients failed: "+String((e&&e.message)||e).slice(0,120),502); }
+        let live=0;
+        for(const c of (cs||[])){ const t=getTraffic(c); live += (t.up||0)+(t.down||0); }
+        const usedB=usedGB*1073741824;
+        const inferred=Math.max(0, usedB - live);
+        let oldDeleted=0;
+        try{ oldDeleted=Number(((await store.getPublicTrafficLedger())[String(pid)]||{}).deletedBytes)||0; }catch{}
+        await store.withLock("pub_traffic", 10, async()=>{
+          const m=await store.getPublicTrafficLedger();
+          m[String(pid)]={ deletedBytes: inferred, updatedAt: Date.now(), calibratedAt: new Date().toISOString(), calibratedBy: "diag" };
+          await store.savePublicTrafficLedger(m);
+        }, 6000);
+        try{ await store.setCache("pub:dead:"+String(pid),"",1); }catch{}
+        try{ await store.pushLog({action:"diag_calibrate", detail:String(panel.name||pid)+" usedGB="+usedGB+" deletedGB="+(inferred/1073741824).toFixed(2)+" (was "+(oldDeleted/1073741824).toFixed(2)+")", by:"diag", meta:null}); }catch{}
+        return new Response(JSON.stringify({ok:true, panel:String(panel.id), name:panel.name||"", liveGB:+(live/1073741824).toFixed(2), usedGB, deletedGB:+(inferred/1073741824).toFixed(2), oldDeletedGB:+(oldDeleted/1073741824).toFixed(2)}),{status:200,headers:{"Content-Type":"application/json; charset=utf-8",...secHeaders}});
+      }catch(e){ return deny(String((e&&e.message)||e).slice(0,200),500); }
+    }
+
+    // 📊 f18: ترافیکِ زندهٔ کلاینت‌های یک پنل (فقط‌خواندنی — برای تطبیق اعداد
+    //    ربات با پنل). GET /diag/traffic?panelId=<id>[&email=<substring>][&limit=N]
+    //    دقیقاً همان مسیر نمایش کاربر: getTraffic(hint) → trafficOf() — و
+    //    «src» می‌گوید عدد نهایی از کجا آمده. ایمیل‌ها ماسک می‌شوند (به‌جز
+    //    الگوی عمومی u<uid> که شناسهٔ خودِ ربات است).
+    if(url.pathname==="/diag/traffic"&&request.method==="GET"){
+      const secHeaders={"Cache-Control":"no-store, no-cache, must-revalidate, private","X-Robots-Tag":"noindex, nofollow, noarchive","X-Content-Type-Options":"nosniff"};
+      const deny=(msg,code)=>new Response(JSON.stringify({ok:false,error:msg}),{status:code,headers:{"Content-Type":"application/json",...secHeaders}});
+      try{
+        if(!(await store.isInstalled())) return deny("not installed",400);
+        const given=request.headers.get("X-Diag-Token")||"";
+        const rec=await store.getDiagToken();
+        await new Promise(r=>setTimeout(r,300));
+        if(!rec || !given || !timingSafeEq(given, rec.token)) return deny("Unauthorized or expired diag token",401);
+        const bumped=await store.bumpDiagToken(rec);
+        if(!bumped) return deny("Token exhausted and revoked. Generate a new one.",429);
+        const q=url.searchParams;
+        const pid=String(q.get("panelId")||"").trim();
+        if(!pid) return deny("panelId required",400);
+        const emFilter=String(q.get("email")||"").trim().toLowerCase();
+        const limit=Math.max(1, Math.min(100, Number(q.get("limit"))||30));
+        const panels=await store.getPanels();
+        const panel=(panels||[]).find(x=>String(x.id)===String(pid));
+        if(!panel) return deny("panel not found",404);
+        const api=new PanelApi(panel.name,panel.url,panel.token,panel.id);
+        let clients=[];
+        try{ clients=await api.getClients(); }catch(e){ return deny("getClients failed: "+String((e&&e.message)||e).slice(0,120),502); }
+        const mask=(em)=> /^u\d+$/i.test(String(em)) ? String(em) : (String(em).slice(0,4)+"***"+String(em).slice(-3));
+        const out=[];
+        for(const c of (clients||[])){
+          if(!c || !c.email) continue;
+          if(emFilter && String(c.email).toLowerCase().indexOf(emFilter)<0) continue;
+          if(out.length>=limit) break;
+          const em=String(c.email);
+          const hint=getTraffic(c);
+          let tr=hint; let src="hint";
+          try{
+            const tr2=await api.trafficOf(em, c);
+            if(tr2 && ((tr2.up||0)+(tr2.down||0)>0 || (tr2.total||0)>0)){ tr=tr2; src="resolved"; }
+          }catch{}
+          const used=(tr.up||0)+(tr.down||0);
+          const total=tr.total||0;
+          out.push({
+            email: mask(em),
+            inbound: c.inboundTag!=null?String(c.inboundTag):(c.inboundId!=null?String(c.inboundId):null),
+            up: tr.up||0, down: tr.down||0,
+            usedBytes: used, totalBytes: total,
+            usedGB: +(used/1073741824).toFixed(2),
+            totalGB: +(total/1073741824).toFixed(2),
+            pct: total>0? Math.min(100, Math.round(used/total*100)) : 0,
+            expiryTime: Number(c.expiryTime||0)||0,
+            enable: c.enable!==false,
+            src
+          });
+        }
+        let inbTotal=null; let classic=!!api.classic;
+        try{ inbTotal=await api.inboundsTrafficTotal(); }catch{}
+        return new Response(JSON.stringify({ok:true, panel:String(panel.id), panelName:panel.name||"", classic, inboundsTotalBytes:inbTotal, inboundsTotalGB: inbTotal!=null?+(inbTotal/1073741824).toFixed(2):null, count:out.length, clients:out}),{status:200,headers:{"Content-Type":"application/json; charset=utf-8",...secHeaders}});
+      }catch(e){ return deny(String((e&&e.message)||e).slice(0,200),500); }
     }
 
     // 🔑 ست/تعویض توکن پنل (یا یوزرنیم:پسورد برای پنل کلاسیک 3x-ui) با توکن عیب‌یابی
