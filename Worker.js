@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f22";
+const CODE_STAMP = "2026-09-19-f23";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -5006,6 +5006,7 @@ class Bot {
 
     if(d==="m:dash") return this.cmdDashboard(chat,mid);
     if(d==="m:stats") return this.cmdStats(chat,mid);
+    if(d==="stats:plans") return this.cmdStatsPlanPie(chat,mid);
     if(d==="stats:panels") return this.cmdStatsPanels(chat,mid);
     if(d.startsWith("stats:ib:")) return this.cmdStatsInbounds(chat,mid,d.substring(9));
     if(d==="m:online") return this.cmdOnline(chat,mid);
@@ -5637,6 +5638,15 @@ class Bot {
     }catch(e){ console.error("cmdStart upsert", e&&e.message); }
 
     if(await this.isAdmin(uid)){
+      // 🔴 f23 (درخواست میدانی): ادمین‌شده‌ها هنوز کیبورد چسبیدهٔ «کاربر عادی»
+      //    (دریافت کانفیگ، کانفیگ‌های من و…) را داشتند — چون هیچ پیامی با
+      //    ReplyKeyboardRemove برایشان نمی‌رفت. اینجا با یک پیام خدماتی
+      //    (send + delete) کیبورد قدیمی برداشته می‌شود و کنسول ادمین می‌ماند.
+      try{
+        const sk=await this.tg.call("sendMessage",{chat_id:chat,text:"🛠",reply_markup:{remove_keyboard:true}});
+        const skmid=sk&&sk.result&&sk.result.message_id;
+        if(skmid){ await new Promise(r=>setTimeout(r,400)); await this.tg.call("deleteMessage",{chat_id:chat,message_id:skmid}); }
+      }catch{}
       return this.showMain(chat, null, uid);
     }
 
@@ -13513,10 +13523,80 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     lines.push("📊  *"+fmtBytes(grandUp+grandDown)+"*  ·  🟢 "+grandOnline+"  ·  👥 "+grandClients);
 
     const rows=[
+      [btn(L(lang,"🥧 آمار قالب‌ها","🥧 Plan share"),"stats:plans")],
       [btn(L(lang,"📡 آمار اینباند","📡 Inbound stats"),"stats:panels")],
       [btn(L(lang,"🔄 بروزرسانی","🔄 Refresh"),"m:stats"), homeBtn(lang)],
     ];
     await this.editOrSend(chat,mid,lines.join("\n"),kb(rows));
+  }
+
+  /**
+   * 🥧 f23: آمار قالب‌ها — سهم هر قالب از کانفیگ‌های صادرهٔ ربات،
+   * به‌شکل نمودار دایره‌ای (عکس از quickchart.io) + راهنمای متنی.
+   * داده از bot_users (ایمیل+پنل داشتن = کانفیگ صادره)؛ قالب با
+   * planId → lastPlanId → تطابق نام حل می‌شود؛ بدون قالب = «نامشخص».
+   * اگر ساخت عکس شکست خورد (سرویس بیرونی در دسترس نبود) → نمودار متنی.
+   */
+  async cmdStatsPlanPie(chat,mid) {
+    const lang=await this.lang();
+    let plans=[], users={};
+    try{ plans=(await this.store.getPlans())||[]; }catch{}
+    try{ users=(await this.store.getBotUsers())||{}; }catch{}
+    const byKey={}; const nameOf={};
+    for(const p of plans){ const k=String(p.id); byKey[k]=0; nameOf[k]=String(p.name||"").trim()||("قالب "+k); }
+    let unmapped=0, total=0;
+    for(const id of Object.keys(users||{})){
+      const u=users[id];
+      if(!u||!u.email||u.panelId==null) continue;
+      total++;
+      let k=null;
+      for(const cand of [u.planId,u.lastPlanId,u.publicPlanId]){
+        if(cand!=null && String(cand).trim()!=="" && Object.prototype.hasOwnProperty.call(byKey,String(cand))){ k=String(cand); break; }
+      }
+      if(k==null){
+        const nm=String(u.planName||u.lastPlanName||"").trim();
+        if(nm && nm!=="migrated"){
+          const hit=plans.find(p=>String(p.name||"").trim()===nm);
+          k=hit?String(hit.id):("n:"+nm);
+          if(nameOf[k]===undefined) nameOf[k]=nm;
+          if(byKey[k]===undefined) byKey[k]=0;
+        }
+      }
+      if(k!=null) byKey[k]++; else unmapped++;
+    }
+    if(!total){
+      return this.editOrSend(chat,mid,
+        uiHead("🥧",L(lang,"آمار قالب‌ها","Plan share"),L(lang,"سهم هر قالب","Share per plan"))+"\n\n"+
+        L(lang,"هنوز کانفیگی با قالب مشخص ثبت نشده.","No plan-tagged configs yet."),
+        kb([[btn(L(lang,"◀ بازگشت","◀ Back"),"m:stats")]]));
+    }
+    const keys=Object.keys(byKey).filter(k=>byKey[k]>0);
+    const labels=keys.map(k=>nameOf[k]||k).concat(unmapped>0?[L(lang,"نامشخص","Unknown")]:[]);
+    const counts=keys.map(k=>byKey[k]).concat(unmapped>0?[unmapped]:[]);
+    const pct=c=>Math.round(c*100/total);
+    const cap=uiHead("🥧",L(lang,"آمار قالب‌ها","Plan share"),L(lang,"سهم هر قالب از کانفیگ‌های صادرهٔ ربات","Each plan's share of bot-issued configs"))
+      +"\n\n"+counts.map((c,i)=>(i+1)+") "+esc(labels[i])+" — *"+c+"* ("+pct(c)+"٪)").join("\n")
+      +"\n\n👥 "+L(lang,"مجموع:","Total:")+" *"+total+"*";
+    let sent=false;
+    try{
+      const palette=["#5b9cf6","#3b6fe0","#6fc26f","#f2b544","#e05f5f","#9b6fe0","#42b8c5","#e08bb0","#8a9aa8","#c2d94c"];
+      const qc={type:"pie",
+        data:{labels:counts.map((_,i)=>String(i+1)),datasets:[{data:counts,backgroundColor:counts.map((_,i)=>palette[i%palette.length])}]},
+        options:{plugins:{legend:{display:false},datalabels:{color:"#ffffff",font:{size:26,weight:"bold"}}}}};
+      const url="https://quickchart.io/chart?w=640&h=640&bkg=%23141a22&c="+encodeURIComponent(JSON.stringify(qc));
+      const r=await this.tg.call("sendPhoto",{chat_id:chat,photo:url,caption:cap,parse_mode:"Markdown"});
+      sent=!!(r&&r.ok);
+    }catch{}
+    if(!sent){
+      const max=Math.max.apply(null,counts);
+      const lines=counts.map((c,i)=>{
+        const f=Math.max(1,Math.round(c*10/max));
+        return (i+1)+") "+esc(labels[i])+"  "+"▰".repeat(f)+"▱".repeat(10-f)+"  *"+c+"* ("+pct(c)+"٪)";
+      });
+      await this.editOrSend(chat,mid,
+        uiHead("🥧",L(lang,"آمار قالب‌ها","Plan share"),L(lang,"سهم هر قالب","Share per plan"))+"\n\n"+lines.join("\n")+"\n\n👥 "+L(lang,"مجموع:","Total:")+" *"+total+"*",
+        kb([[btn(L(lang,"🔄 بروزرسانی","🔄 Refresh"),"stats:plans")],[btn(L(lang,"◀ بازگشت","◀ Back"),"m:stats")]]));
+    }
   }
 
   // List panels for inbound-level stats
@@ -14135,12 +14215,28 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
 
   // ---- Admin Management ----
+  /** 🆕 f23: نام نمایشی یک شناسه از دیتابیس کاربران ربات (خالی اگر ثبت نبود) */
+  async _adminName(id) {
+    try{
+      const u=(await this.store.getBotUsers())[String(id)];
+      if(u){
+        const nm=[u.firstName,u.lastName].map(x=>String(x||"").trim()).filter(Boolean).join(" ");
+        if(nm) return nm;
+        if(u.username) return "@"+String(u.username);
+      }
+    }catch{}
+    return "";
+  }
+
   async cmdAdminList(chat,mid) {
     const lang=await this.lang();
     const admins=await this.store.getAdmins();
     const lines=["👤 *"+t(lang,"admin_management")+"*\n",t(lang,"list_admins")+":\n"];
-    lines.push("• Owner: `"+(await this.ownerId())+"`");
-    for(const a of admins) lines.push("• Admin: `"+a+"`");
+    // 🆕 f23: نام (یا @یوزرنیم) کنار آیدی عددی
+    const oid=String(await this.ownerId());
+    const onm=await this._adminName(oid);
+    lines.push("• Owner: "+(onm?esc(onm)+" · ":"")+"`"+oid+"`");
+    for(const a of admins){ const nm=await this._adminName(String(a)); lines.push("• Admin: "+(nm?esc(nm)+" · ":"")+"`"+a+"`"); }
     if(!admins.length) lines.push("\n"+t(lang,"no_clients"));
     const rows=[
       [btn(t(lang,"add_admin"),"adm:add"),btn(t(lang,"remove_admin"),"adm:remove")],
@@ -14160,7 +14256,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const lang=await this.lang();
     const admins=await this.store.getAdmins();
     if(!admins.length) return this.editOrSend(chat,mid,t(lang,"no_clients"),(await this.backMain()));
-    const rows=admins.map(a=>[btn(a,"adm_del:"+a)]);
+    const rows=[];
+    for(const a of admins){ const nm=await this._adminName(String(a)); rows.push([btn(nm?nm+" · "+String(a):String(a),"adm_del:"+a)]); }
     rows.push([btn(t(lang,"back"),"adm:list")]);
     await this.editOrSend(chat,mid,"Select admin to remove:",kb(rows));
   }
@@ -14228,6 +14325,16 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     await this.tg.msg(chat,
       t(lang,"admin_added")+" `"+target+"`"+(viaName?("  (@"+viaName+")"):""),
       {reply_markup:(await this.backMain())});
+    // 🔴 f23: خودِ ادمین جدید هم بداند + کیبورد «کاربر عادی»‌اش همان لحظه پاک شود
+    try{
+      await this.tg.call("sendMessage",{chat_id:target,
+        text:L(lang,"🎉 شما به‌عنوان ادمین ربات ثبت شدی.\n🛠 دکمه‌های کاربر عادی حذف شدند — با دکمهٔ بعدی یا /start پنل مدیریت را باز کن.",
+                    "🎉 You've been added as an admin.\n🛠 Your regular-user buttons were removed — tap the next button (or /start) to open the console."),
+        reply_markup:{remove_keyboard:true}});
+      await this.tg.call("sendMessage",{chat_id:target,
+        text:L(lang,"🛠 پنل مدیریت","🛠 Admin console"),
+        reply_markup:{inline_keyboard:[[btn(L(lang,"🏠 باز کردن پنل","🏠 Open console"),"m:main")]]}});
+    }catch{}
   }
 
   // ---- Edit Panel Token ----
