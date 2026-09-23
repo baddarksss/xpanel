@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f29";
+const CODE_STAMP = "2026-09-19-f30";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -634,6 +634,48 @@ function formatConfigLinks(links) {
   // drop incomplete truncated tails (no @ or too short)
   return arr.filter(u=>u.length>20 && (u.includes("://")));
 }
+/**
+ * 📱 f30: ساخت QR داخل ورکر (quickchart.io/qr — همان میزبان در دسترسِ نمودارها)
+ * و آپلود مستقیم با multipart. روش قبلی (دادن *آدرس* عکس به تلگرام) اغلب
+ * شکست می‌خورد چون سرورهای تلگرام نمی‌توانند qrserver را باز کنند.
+ * فال‌بک ۱: عکس آمادهٔ qrserver با URL؛ فال‌بک ۲: متن خام لینک.
+ */
+async function sendQrPhoto(tg, chat, data, caption) {
+  data=String(data||"").trim();
+  if(!data) return false;
+  const cap=String(caption||"");
+  try{
+    const ac=new AbortController(); const to=setTimeout(()=>ac.abort(),15000);
+    let blob=null;
+    try{
+      const r=await fetch("https://quickchart.io/qr",{method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({text:data,size:600,format:"png",dark:"000000",light:"ffffff",margin:2}),
+        signal:ac.signal});
+      if(r.ok) blob=await r.blob();
+    } finally { clearTimeout(to); }
+    if(blob&&blob.size){
+      const fd=new FormData();
+      fd.append("chat_id",String(chat));
+      if(cap) fd.append("caption",cap);
+      fd.append("photo",blob,"qr.png");
+      const sr=await fetch(tg.base+"/sendPhoto",{method:"POST",body:fd});
+      const sj=await sr.json().catch(()=>null);
+      if(sj&&sj.ok) return true;
+    }
+  }catch{}
+  // فال‌بک ۱: آدرس عکس برای تلگرام
+  try{
+    const r2=await tg.media("sendPhoto",{chat_id:chat,
+      photo:"https://api.qrserver.com/v1/create-qr-code/?size=600x600&data="+encodeURIComponent(data),
+      caption:cap||undefined});
+    if(r2&&r2.ok) return true;
+  }catch{}
+  // فال‌بک ۲: حداقل لینک خام برسد
+  try{ await tg.call("sendMessage",{chat_id:chat,text:(cap?cap+"\n":"")+"🔗 "+data,disable_web_page_preview:true}); }catch{}
+  return false;
+}
+
 async function sendConfigLinks(tg, chat, links, header, appendFooter = false, lang = "fa", cfg = null) {
   cfg = cfg || _pubCfgCache;
   const list=formatConfigLinks(links);
@@ -725,6 +767,11 @@ async function sendConfigLinks(tg, chat, links, header, appendFooter = false, la
     // هیچ‌وقت مسیر جایگزین را اجرا نمی‌کند.
     if(res && res.ok!==false) delivered++;
   }
+  // 📱 f30: QR خودکار برای «ساب» — اولین لینک http(s) داخل لیست
+  try{
+    const subUrl=list.find(u=>/^https?:\/\//i.test(String(u).trim()));
+    if(subUrl) await sendQrPhoto(tg, chat, String(subUrl).trim(), L(lang,"📱 کد QR ساب","📱 Sub QR code"));
+  }catch{}
   return delivered;
 }
 /**
@@ -14342,14 +14389,12 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       }
     }catch{}
     if(!configData) configData=panel.url;
-    const qrUrl="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data="+encodeURIComponent(configData);
     await this.tg.msg(chat,"📱 *"+t(lang,"qr_code")+"*\n📧 "+esc(email),{
       reply_markup:this.clientBackKb(lang,"cli:"+pid+":"+email),
     });
-    // ⚠️ esc() فقط وقتی معنا دارد که parse_mode ست شده باشد؛ اینجا نیست،
-    //    پس قبلاً کاربر «user\_test» را با بک‌اسلش خام می‌دید. media() خودش
-    //    Markdown را اعمال و در صورت خطا بدون آن دوباره ارسال می‌کند.
-    await this.tg.media("sendPhoto",{chat_id:chat,photo:qrUrl,caption:"📱 Subscription QR — `"+String(email).replace(/`/g,"'")+"`"});
+    // 🔴 f30: ساخت QR درون ورکر + آپلود multipart (ارسال با URL عکس
+    //    اغلب «نمی‌دهد» چون سرور تلگرام qrserver را باز نمی‌کند)
+    await sendQrPhoto(this.tg, chat, configData, "📱 Subscription QR — "+String(email).replace(/`/g,"'"));
   }
 
   // ---- Show Config ----
