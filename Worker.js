@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f28";
+const CODE_STAMP = "2026-09-19-f29";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -128,7 +128,7 @@ const DEFAULT_PUBLIC_CFG = {
 
   // ---- دکمه‌های ثابت منوی کاربر (reply keyboard) ----
   userButtons: {
-    getcfg:   { text: "🎁 دریافت کانفیگ رایگان",  style: "success", enabled: true },
+    getcfg:   { text: "🚀 دریافت کانفیگ رایگان",  style: "success", enabled: true },
     status:   { text: "👤 اکانت من",               style: "primary", enabled: true },
     referral: { text: "🎁 ترافیک هدیه (دعوت)",   style: "success", enabled: true },
     support:  { text: "💬 پشتیبانی",             style: "danger",  enabled: true },
@@ -865,6 +865,20 @@ function fmtDateTimeFa(ms) {
     try { return new Date(t).toISOString().replace("T", " ").slice(0, 16); } catch { return "—"; }
   }
 }
+/** 🌐 f29: تاریخ به زبان کاربر — انگلیسی = میلادی، بقیه = شمسی */
+function fmtDateFor(lang, ms) {
+  if (lang === "en") {
+    const t = Number(ms) || 0;
+    if (t <= 0) return "—";
+    try {
+      const d = new Date(t);
+      const p = (n) => String(n).padStart(2, "0");
+      return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate())
+        + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+    } catch { return "—"; }
+  }
+  return fmtDateTimeFa(ms);
+}
 /** «۳ ساعت پیش» — فاصلهٔ زمانی خوانا */
 function fmtAgo(deltaMs, lang = "fa") {
   const d = Math.max(0, Number(deltaMs) || 0);
@@ -1590,13 +1604,14 @@ function userButtonsFrom(cfg, lang) {
   const en = lang === "en";
   // 🌐 f28: برچسب پیش‌فرض دوزبانه — متنِ سفارشیِ ادمین همیشه می‌ماند؛
   // فقط برچسب‌های پیش‌فرض/قدیمی به زبان کاربر ترجمه می‌شوند.
-  const EN_DEF = { getcfg: "🎁 Get Free Config", status: "👤 My Account", referral: "🎁 Bonus Traffic (Invite)", support: "💬 Support" };
-  const LEGACY = {
-    getcfg: ["🚀 دریافت کانفیگ جدید", "📥 دریافت کانفیگ جدید", "🚀 دریافت کانفیگ", "📥 دریافت کانفیگ", "دریافت کانفیگ جدید", "دریافت کانفیگ"],
-    status: ["📊 وضعیت و مصرف من", "📊 وضعیت من", "وضعیت من", "📊 وضعیت و مصرف", "اکانت من", "👤 اکانت من"],
-    referral: ["🎁 ترافیک رایگان (دعوت)", "ترافیک رایگان (دعوت)", "🎁 ترافیک رایگان", "ترافیک رایگان"],
-    support: [],
-  };
+  const EN_DEF = { getcfg: "🚀 Get Free Config", status: "👤 My Account", referral: "🎁 Bonus Traffic (Invite)", support: "💬 Support" };
+  // 🇮🇷 f29: متن‌های فارسیِ پیش‌فرض که ادمین قبلاً در تنظیمات ذخیره کرده
+  // → legacy حساب می‌شوند تا در حالت انگلیسی ترجمه شوند.
+  const FA_DEF = { getcfg: ["🚀 دریافت کانفیگ رایگان","🎁 دریافت کانفیگ رایگان","دریافت کانفیگ رایگان","🚀 دریافت کانفیگ جدید","🎁 دریافت کانفیگ جدید","📥 دریافت کانفیگ جدید","🚀 دریافت کانفیگ","📥 دریافت کانفیگ","دریافت کانفیگ جدید","دریافت کانفیگ"],
+    status: ["👤 اکانت من","📊 وضعیت و مصرف من","📊 وضعیت من","وضعیت من","📊 وضعیت و مصرف","اکانت من"],
+    referral: ["🎁 ترافیک هدیه (دعوت)","🎁 ترافیک رایگان (دعوت)","ترافیک رایگان (دعوت)","🎁 ترافیک رایگان","ترافیک رایگان"],
+    support: ["💬 پشتیبانی","💬 پیام به پشتیبانی","پیام به پشتیبانی","پشتیبانی"] };
+  const LEGACY = FA_DEF;
   const out = {};
   for (const k of USER_BTN_KEYS) {
     const d = def[k];
@@ -1630,14 +1645,17 @@ function userReplyKb(cfg, preview, lang) {
   const on = USER_BTN_KEYS.filter(k => b[k].enabled);
   const rows = [];
   // پشتیبانی همیشه در ردیف خودش، بقیه دوتایی
-  const pairables = on.filter(k => k !== "support");
+  // 🌐 f29: دعوت و دکمهٔ زبان کنار هم در یک ردیف
+  const pairables = on.filter(k => k !== "support" && k !== "referral");
   for (let i = 0; i < pairables.length; i += 2) {
     rows.push(pairables.slice(i, i + 2).map(k => ({ text: b[k].text })));
   }
   if (on.includes("support")) rows.push([{ text: b.support.text }]);
   if (!rows.length) rows.push([{ text: b.getcfg.text }]);
-  // 🌐 f28: دکمهٔ تغییر زبان — برچسب به زبان «مقصد» است تا غیرفارسی‌زبان هم بفهمد
-  rows.push([{ text: lang === "en" ? "🌐 فارسی" : "🌐 English" }]);
+  // 🌐 f29: دکمهٔ تغییر زبان کنار دعوت — برچسب به زبان «مقصد» با پرچمش
+  const _langBtn = { text: lang === "en" ? "🇮🇷 فارسی" : "🇬🇧 English" };
+  if (on.includes("referral")) rows.push([{ text: b.referral.text }, _langBtn]);
+  else rows.push([_langBtn]);
   // 🧪 فقط در حالت تست: دکمهٔ بازگشت به مدیریت
   // پرچم به‌صورت پارامتر داده می‌شود (نه متغیر سراسری) تا بین
   // درخواست‌های همزمانِ یک ایزوله نشت نکند.
@@ -4804,10 +4822,10 @@ class Bot {
         "💬 پشتیبانی", "💬 پیام به پشتیبانی", "پیام به پشتیبانی", "پشتیبانی",
         "🔄 بروزرسانی منو", "بروزرسانی منو",
         "🎁 ترافیک رایگان (دعوت)", "ترافیک رایگان (دعوت)", "🎁 ترافیک رایگان", "ترافیک رایگان",
-        "🎁 دریافت کانفیگ رایگان", "دریافت کانفیگ رایگان",
-        "🎁 Get Free Config", "Get Free Config", "👤 My Account", "My Account",
+        "🚀 دریافت کانفیگ رایگان", "دریافت کانفیگ رایگان",
+        "🚀 Get Free Config", "Get Free Config", "👤 My Account", "My Account",
         "💬 Support", "Support", "🎁 Bonus Traffic (Invite)", "Bonus Traffic (Invite)",
-        "🌐 English", "🌐 فارسی",
+        "🇬🇧 English", "🇮🇷 فارسی", "🌐 English", "🌐 فارسی",
         PREVIEW_EXIT_TEXT
       ];
       // نام‌های سفارشی ادمین هم باید حالت پشتیبانی را قطع کنند
@@ -5507,7 +5525,7 @@ class Bot {
     if(!(await this.isAdmin(uid))) {
       const t0=String(text||"").trim();
       // 🌐 f28: تغییر زبان — کل ربات برای همین کاربر عوض می‌شود
-      if(t0==="🌐 English" || t0==="🌐 فارسی"){
+      if(t0==="🇬🇧 English" || t0==="🇮🇷 فارسی" || t0==="🌐 English" || t0==="🌐 فارسی"){
         const cur=await this.userLang(uid);
         const nl=(cur==="en")?"fa":"en";
         await this.setUserLang(uid, nl);
@@ -5541,9 +5559,9 @@ class Bot {
         "ترافیک رایگان (دعوت)":"u:referral",
         "🎁 ترافیک رایگان":"u:referral",
         "ترافیک رایگان":"u:referral",
-        "🎁 دریافت کانفیگ رایگان":"u:getcfg",
+        "🚀 دریافت کانفیگ رایگان":"u:getcfg",
         "دریافت کانفیگ رایگان":"u:getcfg",
-        "🎁 Get Free Config":"u:getcfg",
+        "🚀 Get Free Config":"u:getcfg",
         "Get Free Config":"u:getcfg",
         "👤 My Account":"u:status",
         "My Account":"u:status",
@@ -7981,7 +7999,7 @@ class Bot {
         n=await sendConfigLinks(this.tg, chat, links, migTxt||null, true);
       }
       if(!n){
-        await this.tg.call("sendMessage",{chat_id:chat, text:(migTxt?migTxt+"\n\n":"")+L(await this.userLang(uid),"لینک اتصال الان آماده نیست. کمی بعد دوباره «🎁 دریافت کانفیگ رایگان» را بزنید.","Link is not ready yet. Tap \"🎁 Get Free Config\" again shortly."), parse_mode:migTxt?"Markdown":undefined, reply_markup:this.ukb(), disable_web_page_preview:true});
+        await this.tg.call("sendMessage",{chat_id:chat, text:(migTxt?migTxt+"\n\n":"")+L(await this.userLang(uid),"لینک اتصال الان آماده نیست. کمی بعد دوباره «🚀 دریافت کانفیگ رایگان» را بزنید.","Link is not ready yet. Tap \"🚀 Get Free Config\" again shortly."), parse_mode:migTxt?"Markdown":undefined, reply_markup:this.ukb(), disable_web_page_preview:true});
       }
       return;
     }
@@ -8000,8 +8018,8 @@ class Bot {
         // f6: کوتاه و شفاف — کاربر فقط باید بداند «کِی دوباره بزند»
         await this.tg.msg(chat,
           L(_langL,"⏳ *اشتراک فعلی شما هنوز فعال است*","⏳ *Your current plan is still active*")+"\n\n"+
-          L(_langL,"📅 پایان: *","📅 Ends: *")+fmtDateTimeFa(_tLock)+"* "+L(_langL,"("+fmtRemain(_tLock-Date.now(),_langL)+" مانده)","("+fmtRemain(_tLock-Date.now(),_langL)+" left)")+"\n\n"+
-          L(_langL,"بعد از این تاریخ، دوباره «🎁 دریافت کانفیگ رایگان» را بزنید.","After this date, tap \"🎁 Get Free Config\" again."),
+          L(_langL,"📅 پایان: *","📅 Ends: *")+fmtDateFor(_langL,_tLock)+"* "+L(_langL,"("+fmtRemain(_tLock-Date.now(),_langL)+" مانده)","("+fmtRemain(_tLock-Date.now(),_langL)+" left)")+"\n\n"+
+          L(_langL,"بعد از این تاریخ، دوباره «🚀 دریافت کانفیگ رایگان» را بزنید.","After this date, tap \"🚀 Get Free Config\" again."),
           {reply_markup:this.ukb(), disable_web_page_preview:true});
         return;
       }
@@ -8042,12 +8060,12 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         lines.push(uiSep());
         lines.push(_useLine);
         lines.push(L(lang,
-          "⏳ زمان اشتراک: *"+fmtRemain(_exp-_now,lang)+"* مانده (تا *"+fmtDateTimeFa(_exp)+"*)",
-          "⏳ Time left: *"+fmtRemain(_exp-_now,lang)+"* (until *"+fmtDateTimeFa(_exp)+")"));
+          "⏳ زمان اشتراک: *"+fmtRemain(_exp-_now,lang)+"* مانده (تا *"+fmtDateFor(lang,_exp)+"*)",
+          "⏳ Time left: *"+fmtRemain(_exp-_now,lang)+"* (until *"+fmtDateFor(lang,_exp)+")"));
         lines.push("");
         lines.push(L(lang,
-          "بعد از پایان زمان، «🎁 دریافت کانفیگ رایگان» را بزنید.",
-          "When the time ends, tap “🎁 Get Free Config”."));
+          "بعد از پایان زمان، «🚀 دریافت کانفیگ رایگان» را بزنید.",
+          "When the time ends, tap “🚀 Get Free Config”."));
       } else {
         lines.push(L(lang,"✅ *اشتراک شما فعال است*","✅ *Your subscription is active*"));
         lines.push(uiSep());
@@ -8058,13 +8076,13 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         if(_total>0) lines.push(_useLine);
         if(_exp>_now){
           lines.push(L(lang,"⏳ اعتبار باقی‌مانده: *","⏳ Time left: *")+fmtRemain(_exp-_now,lang)+"*");
-          lines.push(L(lang,"📅 پایان دوره (امکان اشتراک جدید): *","📅 Period ends (new plan available): *")+fmtDateTimeFa(_exp)+"*");
+          lines.push(L(lang,"📅 پایان دوره (امکان اشتراک جدید): *","📅 Period ends (new plan available): *")+fmtDateFor(lang,_exp)+"*");
         } else if(!_exp){
           lines.push(L(lang,"⏳ اعتبار زمانی: *نامحدود*","⏳ Time validity: *unlimited*"));
         }
         lines.push("");
         if(_exp>_now){
-          lines.push(L(lang,"⏳ زمان دریافت کانفیگ جدید: *","⏳ Next free config: *")+fmtDateTimeFa(_exp)+"*"
+          lines.push(L(lang,"⏳ زمان دریافت کانفیگ جدید: *","⏳ Next free config: *")+fmtDateFor(lang,_exp)+"*"
             +"  ("+L(lang,"بعد از پایان این اشتراک","after this plan ends")+")");
         }
       }
@@ -8209,7 +8227,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         await this._restoreUrlRefresh(uid);
         await this.tg.call("sendMessage",{
           chat_id:chat,
-          text:L(await this.userLang(uid),"⚠️ الان نتوانستیم کانفیگ را از سرور بخوانیم. کمی بعد دوباره «🎁 دریافت کانفیگ رایگان» را بزنید — حجم و اعتبارتان محفوظ است.","⚠️ Could not read the config from the server. Tap \"🎁 Get Free Config\" again shortly — your volume and validity are safe."),
+          text:L(await this.userLang(uid),"⚠️ الان نتوانستیم کانفیگ را از سرور بخوانیم. کمی بعد دوباره «🚀 دریافت کانفیگ رایگان» را بزنید — حجم و اعتبارتان محفوظ است.","⚠️ Could not read the config from the server. Tap \"🚀 Get Free Config\" again shortly — your volume and validity are safe."),
           reply_markup:this.ukb()
         });
         return;
@@ -8218,7 +8236,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       if(!cl){
         await this.tg.call("sendMessage",{
           chat_id:chat,
-          text:L(await this.userLang(uid),"کانفیگ فعالی روی این سرور پیدا نشد.\nاز دکمهٔ «🎁 دریافت کانفیگ رایگان» یک کانفیگ تازه بگیرید.","No active config found on this server.\nGet a fresh one via \"🎁 Get Free Config\"."),
+          text:L(await this.userLang(uid),"کانفیگ فعالی روی این سرور پیدا نشد.\nاز دکمهٔ «🚀 دریافت کانفیگ رایگان» یک کانفیگ تازه بگیرید.","No active config found on this server.\nGet a fresh one via \"🚀 Get Free Config\"."),
           reply_markup:this.ukb()
         });
         return;
@@ -8229,7 +8247,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       if(exp && exp<=now){
         await this.tg.call("sendMessage",{
           chat_id:chat,
-          text:L(await this.userLang(uid),"اعتبار اشتراک شما به پایان رسیده.\nاز دکمهٔ «🎁 دریافت کانفیگ رایگان» دوباره اشتراک بگیرید.","Your plan has expired.\nGet a new one via \"🎁 Get Free Config\"."),
+          text:L(await this.userLang(uid),"اعتبار اشتراک شما به پایان رسیده.\nاز دکمهٔ «🚀 دریافت کانفیگ رایگان» دوباره اشتراک بگیرید.","Your plan has expired.\nGet a new one via \"🚀 Get Free Config\"."),
           reply_markup:this.ukb()
         });
         return;
@@ -8281,7 +8299,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         await this._restoreUrlRefresh(uid);
         await this.tg.call("sendMessage",{
           chat_id:chat,
-          text:refTxt+"\n\n"+L(await this.userLang(uid),"لینک‌ها ارسال نشدند — کمی بعد دوباره «🎁 دریافت کانفیگ رایگان» را بزنید.","Links could not be sent — tap \"🎁 Get Free Config\" again shortly."),
+          text:refTxt+"\n\n"+L(await this.userLang(uid),"لینک‌ها ارسال نشدند — کمی بعد دوباره «🚀 دریافت کانفیگ رایگان» را بزنید.","Links could not be sent — tap \"🚀 Get Free Config\" again shortly."),
           parse_mode:"Markdown",
           reply_markup: await this.ukbFor(uid),
           disable_web_page_preview:true
@@ -8729,7 +8747,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       if(!active || !active.client || active.notFound || active.expired){
         const _tLockC=await this._lastAcctLock(uid);
         if(_tLockC>Date.now()+30000){
-          return say(L(await this.userLang(uid),"⏳ *اشتراک فعلی شما هنوز فعال است*\n\n📅 پایان: *"+fmtDateTimeFa(_tLockC)+"*\n\nبعد از این تاریخ، دوباره «🎁 دریافت کانفیگ رایگان» را بزنید.","⏳ *Your current plan is still active*\n\n📅 Ends: *"+fmtDateTimeFa(_tLockC)+"*\n\nAfter that, tap \"🎁 Get Free Config\" again."));
+          return say(L(await this.userLang(uid),"⏳ *اشتراک فعلی شما هنوز فعال است*\n\n📅 پایان: *"+fmtDateFor(await this.userLang(uid),_tLockC)+"*\n\nبعد از این تاریخ، دوباره «🚀 دریافت کانفیگ رایگان» را بزنید.","⏳ *Your current plan is still active*\n\n📅 Ends: *"+fmtDateFor(await this.userLang(uid),_tLockC)+"*\n\nAfter that, tap \"🚀 Get Free Config\" again."));
         }
       }
       if(active && active.reachable && active.client && !active.expired){
@@ -8742,9 +8760,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           const _e2=tsMs(Number(_c2.expiryTime||0)||0);
           if(_to2>0 && _u2>=_to2 && _e2>Date.now()){
             _why="📉 حجم این دوره‌تان تمام شده ("+fmtGib(_u2)+" از "+fmtGib(_to2)+" گیگ) — زمانش هنوز باقی است.\n"
-              +"📅 پایان دوره: *"+fmtDateTimeFa(_e2)+"* — بعد از این تاریخ دوباره «🎁 دریافت کانفیگ رایگان» را بزنید.";
+              +"📅 پایان دوره: *"+fmtDateFor(await this.userLang(uid),_e2)+"* — بعد از این تاریخ دوباره «🚀 دریافت کانفیگ رایگان» را بزنید.";
           } else if(_e2>Date.now()){
-            _why=L(await this.userLang(uid),"شما هنوز اشتراک فعال دارید.\n📅 پایان دوره: *"+fmtDateTimeFa(_e2)+"* — بعد از این تاریخ می‌توانید دوباره بگیرید.","You still have an active plan.\n📅 Period ends: *"+fmtDateTimeFa(_e2)+"* — you can get a new one after that.");
+            _why=L(await this.userLang(uid),"شما هنوز اشتراک فعال دارید.\n📅 پایان دوره: *"+fmtDateFor(await this.userLang(uid),_e2)+"* — بعد از این تاریخ می‌توانید دوباره بگیرید.","You still have an active plan.\n📅 Period ends: *"+fmtDateFor(await this.userLang(uid),_e2)+"* — you can get a new one after that.");
           }
         }catch{}
         return say(_why);
@@ -9828,11 +9846,11 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         const _hasMapM=!!(_buM && _buM.email && _buM.panelId!=null);
         const _tLockM=await this._lastAcctLock(uid);
         if(!_hasMapM && _tLockM<=Date.now()+30000){
-          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🎁 Get Free Config\" to start."), reply_markup:this.ukb()});
+          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🚀 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🚀 Get Free Config\" to start."), reply_markup:this.ukb()});
           return;
         }
         if(_tLockM>Date.now()+30000){
-          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⏳ اشتراک فعلی شما هنوز فعال است.\nبعد از پایان آن، «🎁 دریافت کانفیگ رایگان» را بزنید.","⏳ Your current plan is still active.\nAfter it ends, tap \"🎁 Get Free Config\"."), reply_markup:this.ukb()});
+          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⏳ اشتراک فعلی شما هنوز فعال است.\nبعد از پایان آن، «🚀 دریافت کانفیگ رایگان» را بزنید.","⏳ Your current plan is still active.\nAfter it ends, tap \"🚀 Get Free Config\"."), reply_markup:this.ukb()});
           return;
         }
         await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.","⚠️ Service is temporarily unavailable.\nYour subscription was not deleted — please try again shortly."), reply_markup:this.ukb()});
@@ -9854,7 +9872,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
             try{ await this.notifyOwner("⚠️ کاربر «"+String((active&&active.email)||uid)+"» روی پنل پیدا نشد و بازیابی خودکار هم ناموفق بود — تا پایان دوره قفل شد.", "lost:"+String((active&&active.email)||uid), 3600); }catch{}
             await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⚠️ اشتراک شما در حال حاضر قابل بازیابی نیست.\nتا پایان دورهٔ فعلی امکان اشتراک جدید نیست — لطفاً با پشتیبانی در تماس باشید.","⚠️ Your subscription cannot be recovered right now.\nNo new plan until this period ends — please contact support."), reply_markup:this.ukb()});
           } else {
-            await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🎁 Get Free Config\" to start."), reply_markup:this.ukb()});
+            await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🚀 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🚀 Get Free Config\" to start."), reply_markup:this.ukb()});
           }
           return;
         }
@@ -9908,7 +9926,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     if(active && active.reachable===false && !active.notFound){
       await this.tg.call("sendMessage",{
         chat_id:chat,
-        text:L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید یا «🎁 دریافت کانفیگ رایگان» را بزنید.","⚠️ Service is temporarily unavailable.\nYour subscription was not deleted — try again shortly or tap \"🎁 Get Free Config\"."),
+        text:L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید یا «🚀 دریافت کانفیگ رایگان» را بزنید.","⚠️ Service is temporarily unavailable.\nYour subscription was not deleted — try again shortly or tap \"🚀 Get Free Config\"."),
         reply_markup:this.ukb()
       });
       return;
@@ -9938,11 +9956,11 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         const _hasMapM=!!(_buM && _buM.email && _buM.panelId!=null);
         const _tLockM=await this._lastAcctLock(uid);
         if(!_hasMapM && _tLockM<=Date.now()+30000){
-          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🎁 Get Free Config\" to start."), reply_markup:this.ukb()});
+          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🚀 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🚀 Get Free Config\" to start."), reply_markup:this.ukb()});
           return;
         }
         if(_tLockM>Date.now()+30000){
-          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⏳ اشتراک فعلی شما هنوز فعال است.\nبعد از پایان آن، «🎁 دریافت کانفیگ رایگان» را بزنید.","⏳ Your current plan is still active.\nAfter it ends, tap \"🎁 Get Free Config\"."), reply_markup:this.ukb()});
+          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⏳ اشتراک فعلی شما هنوز فعال است.\nبعد از پایان آن، «🚀 دریافت کانفیگ رایگان» را بزنید.","⏳ Your current plan is still active.\nAfter it ends, tap \"🚀 Get Free Config\"."), reply_markup:this.ukb()});
           return;
         }
         await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.","⚠️ Service is temporarily unavailable.\nYour subscription was not deleted — please try again shortly."), reply_markup:this.ukb()});
@@ -9964,7 +9982,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
             try{ await this.notifyOwner("⚠️ کاربر «"+String((active&&active.email)||uid)+"» روی پنل پیدا نشد و بازیابی خودکار هم ناموفق بود — تا پایان دوره قفل شد.", "lost:"+String((active&&active.email)||uid), 3600); }catch{}
             await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⚠️ اشتراک شما در حال حاضر قابل بازیابی نیست.\nتا پایان دورهٔ فعلی امکان اشتراک جدید نیست — لطفاً با پشتیبانی در تماس باشید.","⚠️ Your subscription cannot be recovered right now.\nNo new plan until this period ends — please contact support."), reply_markup:this.ukb()});
           } else {
-            await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🎁 Get Free Config\" to start."), reply_markup:this.ukb()});
+            await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🚀 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🚀 Get Free Config\" to start."), reply_markup:this.ukb()});
           }
           return;
         }
@@ -9973,14 +9991,14 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     // 🎁 f28: کانفیگ منقضی = «کانفیگ فعال ندارید» — آمار قدیمی نشان داده نشود
     if(active.expired){
       await this.tg.call("sendMessage",{chat_id:chat,
-        text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🎁 Get Free Config\" to start."),
+        text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🚀 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🚀 Get Free Config\" to start."),
         reply_markup:this.ukb()});
       return;
     }
     if(active.reachable===false){
       await this.tg.call("sendMessage",{
         chat_id:chat,
-        text:L(await this.userLang(uid),"⚠️ اتصال قبلی در دسترس نیست.\nاگر لینک کار نمی‌کند، «🎁 دریافت کانفیگ رایگان» را بزنید تا در صورت امکان لینک تازه برایتان ساخته شود.","⚠️ Previous connection is unreachable.\nIf the link doesn\u2019t work, tap \"🎁 Get Free Config\" to get a fresh link if possible."),
+        text:L(await this.userLang(uid),"⚠️ اتصال قبلی در دسترس نیست.\nاگر لینک کار نمی‌کند، «🚀 دریافت کانفیگ رایگان» را بزنید تا در صورت امکان لینک تازه برایتان ساخته شود.","⚠️ Previous connection is unreachable.\nIf the link doesn\u2019t work, tap \"🚀 Get Free Config\" to get a fresh link if possible."),
         reply_markup:this.ukb()
       });
       return;
@@ -10076,10 +10094,10 @@ if(active && active.reachable && active.client && !active.expired && !active.not
 
     lines.push("");
     if(active.expired){
-      lines.push(L(lang,"برای تمدید، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.",
+      lines.push(L(lang,"برای تمدید، دکمهٔ «🚀 دریافت کانفیگ رایگان» را بزنید.",
                        "To renew, tap “Get new config”."));
     } else {
-      lines.push(L(lang,"لینک اتصال از دکمهٔ «🎁 دریافت کانفیگ رایگان» قابل دریافت است.",
+      lines.push(L(lang,"لینک اتصال از دکمهٔ «🚀 دریافت کانفیگ رایگان» قابل دریافت است.",
                        "Your connection link is in “My configs”."));
     }
     await this.tg.call("sendMessage",{chat_id:chat, text:lines.join("\n"), reply_markup:this.ukb(), disable_web_page_preview:true});
@@ -10640,7 +10658,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         (saved.bonusHold === true
           ? L(lang, "🔒 حالت *ذخیره* روشن است؛ روی کانفیگ بعدی اعمال نمی‌شود.\nبرای تغییر: «🎁 ترافیک رایگان».",
                     "🔒 *Save* mode is on; it won't apply to your next config.\nChange it in “🎁 Free traffic”.")
-          : L(lang, "برای استفاده، «🎁 دریافت کانفیگ رایگان» را بزنید.", "Tap “🎁 Get Free Config” to use it."))
+          : L(lang, "برای استفاده، «🚀 دریافت کانفیگ رایگان» را بزنید.", "Tap “🚀 Get Free Config” to use it."))
       );
     } catch {}
 
@@ -11119,7 +11137,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const cfg = await this.store.getPublicCfg();
     const on = cfg.urlRefreshTextEnabled !== false;
     const previewBtn = (() => {
-      try { return String(userButtonsFrom(cfg).getcfg.text || "").trim() || "🎁 دریافت کانفیگ رایگان"; }
+      try { return String(userButtonsFrom(cfg).getcfg.text || "").trim() || "🚀 دریافت کانفیگ رایگان"; }
       catch { return "🚀 دریافت کانفیگ جدید"; }
     })();
     const cur = urlRefreshNoticeText(cfg, previewBtn);
@@ -16081,7 +16099,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       const cfg = await this.store.getPublicCfg();
       const getLbl = (() => {
         try {
-          let s = String(userButtonsFrom(cfg).getcfg.text || "").trim() || "🎁 دریافت کانفیگ رایگان";
+          let s = String(userButtonsFrom(cfg).getcfg.text || "").trim() || "🚀 دریافت کانفیگ رایگان";
           return s.replace(/[*_`\[\]]/g, "");
         } catch { return "🚀 دریافت کانفیگ جدید"; }
       })();
@@ -16931,7 +16949,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     try{
       const getLbl=(()=>{
         try{
-          let s=String(userButtonsFrom(cfg).getcfg.text||"").trim() || "🎁 دریافت کانفیگ رایگان";
+          let s=String(userButtonsFrom(cfg).getcfg.text||"").trim() || "🚀 دریافت کانفیگ رایگان";
           return s.replace(/[*_`\[\]]/g, "");
         }catch{ return "🚀 دریافت کانفیگ جدید"; }
       })();
