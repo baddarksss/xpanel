@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f25";
+const CODE_STAMP = "2026-09-19-f26";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -12996,6 +12996,51 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     return this.cmdPublicPlanStatsText(chat,mid);
   }
 
+  /**
+   * 🇮🇷 f26: موتور متن quickchart اتصال/چینش فارسی را بلد نیست (حروف جدا و چپ‌به‌راست
+   * رندر می‌شد). راه‌حل: تبدیل هر حرف به «فرم presentation» درست (آخر/اول/وسط/منفصل)
+   * + معکوس‌سازی بصری کلمه‌ها و ترتیب کلمه‌ها برای چینش راست‌به‌چپ. فقط روی
+   * برچسب‌های *عکس* اعمال می‌شود؛ متن‌های تلگرام سر خود می‌مانند.
+   */
+  _faShape(text) {
+    const F={"ء":["ﺀ",0,0,0],"آ":["ﺁ","ﺂ",0,0],"أ":["ﺃ","ﺄ",0,0],"ؤ":["ﺅ","ﺆ",0,0],
+      "إ":["ﺇ","ﺈ",0,0],"ئ":["ﺉ","ﺊ","ﺋ","ﺌ"],"ا":["ﺍ","ﺎ",0,0],
+      "ب":["ﺏ","ﺐ","ﺑ","ﺒ"],"ة":["ﺓ","ﺔ",0,0],"ت":["ﺕ","ﺖ","ﺗ","ﺘ"],
+      "ث":["ﺙ","ﺚ","ﺛ","ﺜ"],"ج":["ﺝ","ﺞ","ﺟ","ﺠ"],
+      "ح":["ﺡ","ﺢ","ﺣ","ﺤ"],"خ":["ﺥ","ﺦ","ﺧ","ﺨ"],
+      "د":["ﺩ","ﺪ",0,0],"ذ":["ﺫ","ﺬ",0,0],"ر":["ﺭ","ﺮ",0,0],
+      "ز":["ﺯ","ﺰ",0,0],"س":["ﺱ","ﺲ","ﺳ","ﺴ"],"ش":["ﺵ","ﺶ","ﺷ","ﺸ"],
+      "ص":["ﺹ","ﺺ","ﺻ","ﺼ"],"ض":["ﺽ","ﺾ","ﺿ","ﻀ"],
+      "ط":["ﻁ","ﻂ","ﻃ","ﻄ"],"ظ":["ﻅ","ﻆ","ﻇ","ﻈ"],
+      "ع":["ﻉ","ﻊ","ﻋ","ﻌ"],"غ":["ﻍ","ﻎ","ﻏ","ﻐ"],
+      "ف":["ﻑ","ﻒ","ﻓ","ﻔ"],"ق":["ﻕ","ﻖ","ﻗ","ﻘ"],
+      "ک":["ﮎ","ﮏ","ﮐ","ﮑ"],"گ":["ﮒ","ﮓ","ﮔ","ﮕ"],
+      "ل":["ﻝ","ﻞ","ﻟ","ﻠ"],"م":["ﻡ","ﻢ","ﻣ","ﻤ"],
+      "ن":["ﻥ","ﻦ","ﻧ","ﻨ"],"و":["ﻭ","ﻮ",0,0],"ه":["ﻩ","ﻪ","ﻫ","ﻬ"],
+      "ی":["ﯼ","ﯽ","ﯾ","ﯿ"],"چ":["ﭺ","ﭻ","ﭼ","ﭽ"],
+      "پ":["ﭖ","ﭗ","ﭘ","ﭙ"],"ژ":["ﮊ","ﮋ",0,0],
+      "ك":["ﻙ","ﻚ","ﻛ","ﻜ"],"ي":["ﻱ","ﻲ","ﻳ","ﻴ"]};
+    const isAr=(ch)=>/[\u0600-\u06FF\uFB50-\uFEFF]/.test(ch);
+    const words=String(text).split(" ");
+    const out=[];
+    for(const w of words){
+      if(!w.split("").some(isAr)){ out.push(w); continue; }
+      let shaped="";
+      for(let i=0;i<w.length;i++){
+        const ch=w[i], f=F[ch];
+        if(!f){ shaped+=ch; continue; }
+        const prevJoin=i>0 && !!F[w[i-1]] && F[w[i-1]][2];
+        const nxt=w[i+1];
+        const nextJoin=!!f[2] && nxt && !!F[nxt];
+        shaped += (prevJoin&&nextJoin&&f[3]) ? f[3] : (prevJoin&&f[1]) ? f[1] : (nextJoin&&f[2]) ? f[2] : f[0];
+      }
+      out.push(shaped.split("").reverse().join(""));
+    }
+    const firstAr=words.length>0 && words[0].split("").some(isAr);
+    if(firstAr) out.reverse();
+    return out.join(" ");
+  }
+
   /** ساخت + ارسال عکس 🥧 از دادهٔ آمار قالب. true=عکس رفت */
   async _planPieSend(chat, mid, st, lang, mode) {
     try{
@@ -13019,16 +13064,20 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           L(lang,"کدام قالب بیشتر استفاده می‌شود","Which plan is used the most")))+"\n\n"+head+"\n\n"+rows.join("\n")+"\n…"; }
       cap+="\n\n↓ "+L(lang,"جزئیات کامل در پیام بعدی","full details in the next message");
       const palette=["#5b9cf6","#3b6fe0","#6fc26f","#f2b544","#e05f5f","#9b6fe0","#42b8c5","#e08bb0","#8a9aa8","#c2d94c"];
-      const chartJS="({type:'pie',data:{labels:"+JSON.stringify(items.map((_,i)=>String(i+1)))+
+      // 🇮🇷 f26: نام قالب روی خود عکس (لجند پایین) — با شکل‌دهی فارسی چون
+      //    موتور متن سرویس نمودار اتصال/چینش فارسی را بلد نیست
+      const pieLabels=items.map(x=>this._faShape(x.name));
+      const chartJS="({type:'pie',data:{labels:"+JSON.stringify(pieLabels)+
         ",datasets:[{data:"+JSON.stringify(items.map(x=>x.value))+",backgroundColor:"+JSON.stringify(items.map((_,i)=>palette[i%palette.length]))+
-        "}]},options:{legend:{display:false},plugins:{datalabels:{color:'#ffffff',font:{size:30,weight:'bold'},"+
+        "}]},options:{legend:{display:true,position:'bottom',labels:{color:'#ffffff',font:{size:26},boxWidth:28}},"+
+        "plugins:{datalabels:{color:'#ffffff',font:{size:28,weight:'bold'},"+
         "formatter:(v,ctx)=>(v*100/ctx.dataset.data.reduce((a,b)=>a+b,0)).toFixed(1)+'%'}}}})";
       const _qc=new AbortController(); const _qt=setTimeout(()=>_qc.abort(),15000);
       let blob=null;
       try{
         const resp=await fetch("https://quickchart.io/chart",{method:"POST",
           headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({width:640,height:640,backgroundColor:"#141a22",chart:chartJS}),
+          body:JSON.stringify({width:640,height:660,backgroundColor:"#141a22",chart:chartJS}),
           signal:_qc.signal});
         if(resp.ok) blob=await resp.blob();
       } finally { clearTimeout(_qt); }
@@ -13665,16 +13714,18 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       //    quickchart formatter تابعی را اجرا می‌کند (٪ داخل برش مثل عکس نمونه)
       //    و لجندِ بالا هم نمی‌آید. GET/JSON تابع را نادیده می‌گیرد.
       const palette=["#5b9cf6","#3b6fe0","#6fc26f","#f2b544","#e05f5f","#9b6fe0","#42b8c5","#e08bb0","#8a9aa8","#c2d94c"];
-      const chartJS="({type:'pie',data:{labels:"+JSON.stringify(counts.map((_,i)=>String(i+1)))+
+      // 🇮🇷 f26: نام قالب روی عکس با شکل‌دهی فارسی
+      const chartJS="({type:'pie',data:{labels:"+JSON.stringify(counts.map((_,i)=>this._faShape(labels[i])))+
         ",datasets:[{data:"+JSON.stringify(counts)+",backgroundColor:"+JSON.stringify(counts.map((_,i)=>palette[i%palette.length]))+
-        "}]},options:{legend:{display:false},plugins:{datalabels:{color:'#ffffff',font:{size:30,weight:'bold'},"+
+        "}]},options:{legend:{display:true,position:'bottom',labels:{color:'#ffffff',font:{size:26},boxWidth:28}},"+
+        "plugins:{datalabels:{color:'#ffffff',font:{size:28,weight:'bold'},"+
         "formatter:(v,ctx)=>Math.round(v*100/ctx.dataset.data.reduce((a,b)=>a+b,0))+'%'}}}})";
       const _qc=new AbortController(); const _qt=setTimeout(()=>_qc.abort(),15000);
       let blob=null;
       try{
         const resp=await fetch("https://quickchart.io/chart",{method:"POST",
           headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({width:640,height:640,backgroundColor:"#141a22",chart:chartJS}),
+          body:JSON.stringify({width:640,height:660,backgroundColor:"#141a22",chart:chartJS}),
           signal:_qc.signal});
         if(resp.ok) blob=await resp.blob();
         else try{ await this.addLog("plan_pie","qc http "+resp.status, await this.ownerId()); }catch{}
