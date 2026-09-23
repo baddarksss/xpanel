@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f27";
+const CODE_STAMP = "2026-09-19-f28";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -128,8 +128,7 @@ const DEFAULT_PUBLIC_CFG = {
 
   // ---- دکمه‌های ثابت منوی کاربر (reply keyboard) ----
   userButtons: {
-    getcfg:   { text: "🚀 دریافت کانفیگ جدید",   style: "success", enabled: true },
-    configs:  { text: "🔗 کانفیگ‌های من",        style: "primary", enabled: true },
+    getcfg:   { text: "🎁 دریافت کانفیگ رایگان",  style: "success", enabled: true },
     status:   { text: "👤 اکانت من",               style: "primary", enabled: true },
     referral: { text: "🎁 ترافیک هدیه (دعوت)",   style: "success", enabled: true },
     support:  { text: "💬 پشتیبانی",             style: "danger",  enabled: true },
@@ -1581,22 +1580,31 @@ let _pubCfgCache = null;
 const PREVIEW_EXIT_TEXT = "🛠 حالت مدیریت";
 
 /** کلیدهای منوی کاربر به ترتیب چیدمان (۲ تایی در هر ردیف، پشتیبانی تنها) */
-const USER_BTN_KEYS = ["getcfg","configs","status","referral","support"];
+const USER_BTN_KEYS = ["getcfg","status","referral","support"]; // f28: «کانفیگ‌های من» حذف شد
 const USER_BTN_CB = { getcfg:"u:getcfg", configs:"u:configs", status:"u:status", referral:"u:referral", support:"u:support" };
 
 /** دکمه‌های منوی کاربر را از کانفیگ می‌سازد (با fallback به پیش‌فرض) */
-function userButtonsFrom(cfg) {
+function userButtonsFrom(cfg, lang) {
   const def = DEFAULT_PUBLIC_CFG.userButtons;
   const src = (cfg && cfg.userButtons) || {};
+  const en = lang === "en";
+  // 🌐 f28: برچسب پیش‌فرض دوزبانه — متنِ سفارشیِ ادمین همیشه می‌ماند؛
+  // فقط برچسب‌های پیش‌فرض/قدیمی به زبان کاربر ترجمه می‌شوند.
+  const EN_DEF = { getcfg: "🎁 Get Free Config", status: "👤 My Account", referral: "🎁 Bonus Traffic (Invite)", support: "💬 Support" };
+  const LEGACY = {
+    getcfg: ["🚀 دریافت کانفیگ جدید", "📥 دریافت کانفیگ جدید", "🚀 دریافت کانفیگ", "📥 دریافت کانفیگ", "دریافت کانفیگ جدید", "دریافت کانفیگ"],
+    status: ["📊 وضعیت و مصرف من", "📊 وضعیت من", "وضعیت من", "📊 وضعیت و مصرف", "اکانت من", "👤 اکانت من"],
+    referral: ["🎁 ترافیک رایگان (دعوت)", "ترافیک رایگان (دعوت)", "🎁 ترافیک رایگان", "ترافیک رایگان"],
+    support: [],
+  };
   const out = {};
   for (const k of USER_BTN_KEYS) {
     const d = def[k];
     const c = src[k] || {};
-    let text = String(c.text || d.text);
-    if (k === "status") {
-      const olds = ["📊 وضعیت و مصرف من", "📊 وضعیت من", "وضعیت من", "📊 وضعیت و مصرف", "اکانت من"];
-      if (!c.text || olds.includes(String(c.text).trim())) text = d.text;
-    }
+    const custom = String(c.text || "").trim();
+    const text = !custom || (LEGACY[k] || []).includes(custom)
+      ? (en ? EN_DEF[k] : (d ? d.text : custom))
+      : custom;
     out[k] = {
       text,
       style: String(c.style || d.style),
@@ -1616,8 +1624,9 @@ function userButtonsFrom(cfg) {
  * پشتیبانی می‌کنند از آن استفاده می‌کنند و بقیه صرفاً نادیده‌اش می‌گیرند.
  * حذفش باعث ساده/بی‌رنگ شدن کیبورد کاربر می‌شود.
  */
-function userReplyKb(cfg, preview) {
-  const b = userButtonsFrom(cfg || _pubCfgCache);
+function userReplyKb(cfg, preview, lang) {
+  lang = lang === "en" ? "en" : "fa";
+  const b = userButtonsFrom(cfg || _pubCfgCache, lang);
   const on = USER_BTN_KEYS.filter(k => b[k].enabled);
   const rows = [];
   // پشتیبانی همیشه در ردیف خودش، بقیه دوتایی
@@ -1627,6 +1636,8 @@ function userReplyKb(cfg, preview) {
   }
   if (on.includes("support")) rows.push([{ text: b.support.text }]);
   if (!rows.length) rows.push([{ text: b.getcfg.text }]);
+  // 🌐 f28: دکمهٔ تغییر زبان — برچسب به زبان «مقصد» است تا غیرفارسی‌زبان هم بفهمد
+  rows.push([{ text: lang === "en" ? "🌐 فارسی" : "🌐 English" }]);
   // 🧪 فقط در حالت تست: دکمهٔ بازگشت به مدیریت
   // پرچم به‌صورت پارامتر داده می‌شود (نه متغیر سراسری) تا بین
   // درخواست‌های همزمانِ یک ایزوله نشت نکند.
@@ -4541,7 +4552,7 @@ class Bot {
    * تا در همزمانی، دکمهٔ مدیریت به کاربر عادی نشت نکند.
    */
   ukb(cfg) {
-    return userReplyKb(cfg, this._preview === true);
+    return userReplyKb(cfg, this._preview === true, this._ulang);
   }
 
   /**
@@ -4559,7 +4570,27 @@ class Bot {
       const id = String(targetUid || "");
       if(id && await this.isRealAdmin(id)) on = !!(await this.store.get(PREVIEW_KEY(id)));
     }catch{}
-    return userReplyKb(cfg, on);
+    return userReplyKb(cfg, on, await this.userLang(targetUid));
+  }
+
+  /** 🌐 f28: زبان هر کاربر عادی — پیش‌فرض فارسی؛ در bot_users[uid].lang ذخیره می‌شود */
+  async userLang(uid) {
+    try{
+      const u=(await this.store.getBotUsers())[String(uid)];
+      return (u && u.lang === "en") ? "en" : "fa";
+    }catch{ return "fa"; }
+  }
+  async setUserLang(uid, lang) {
+    try{
+      const id=String(uid); const v=(lang==="en")?"en":"fa";
+      await this.store.withBotUsersPersistent((m)=>{ const prev=m[id]||{}; m[id]={...prev, id, lang:v}; }, 3);
+    }catch{}
+  }
+  /** خوش‌آمد: اگر ادمین متن سفارشی نگذاشته باشد، به زبان کاربر */
+  _welcomeFor(cfg, lang) {
+    const w=String((cfg && cfg.welcomeText) || "").trim();
+    if(!w || w==="خوش آمدید.") return L(lang, "خوش آمدید.", "Welcome.");
+    return w.replace(/\\n/g,"\n");
   }
 
   /** آیا واقعاً ادمین است؟ (نادیده‌گرفتن حالت پیش‌نمایش) — برای بررسی‌های امنیتی */
@@ -4773,6 +4804,10 @@ class Bot {
         "💬 پشتیبانی", "💬 پیام به پشتیبانی", "پیام به پشتیبانی", "پشتیبانی",
         "🔄 بروزرسانی منو", "بروزرسانی منو",
         "🎁 ترافیک رایگان (دعوت)", "ترافیک رایگان (دعوت)", "🎁 ترافیک رایگان", "ترافیک رایگان",
+        "🎁 دریافت کانفیگ رایگان", "دریافت کانفیگ رایگان",
+        "🎁 Get Free Config", "Get Free Config", "👤 My Account", "My Account",
+        "💬 Support", "Support", "🎁 Bonus Traffic (Invite)", "Bonus Traffic (Invite)",
+        "🌐 English", "🌐 فارسی",
         PREVIEW_EXIT_TEXT
       ];
       // نام‌های سفارشی ادمین هم باید حالت پشتیبانی را قطع کنند
@@ -5445,6 +5480,7 @@ class Bot {
   async onText(msg) {
     const uid=String(msg.from.id);
     this._uid=uid;
+    this._ulang=await this.userLang(uid);
     const chat=msg.chat.id; const text=msg.text;
     const state=await this.store.getState(uid);
 
@@ -5470,6 +5506,16 @@ class Bot {
     // Public users: fixed bottom reply keyboard
     if(!(await this.isAdmin(uid))) {
       const t0=String(text||"").trim();
+      // 🌐 f28: تغییر زبان — کل ربات برای همین کاربر عوض می‌شود
+      if(t0==="🌐 English" || t0==="🌐 فارسی"){
+        const cur=await this.userLang(uid);
+        const nl=(cur==="en")?"fa":"en";
+        await this.setUserLang(uid, nl);
+        this._ulang=nl;
+        const cfgW=await this.store.getPublicCfg();
+        await this.tg.msg(chat, this._welcomeFor(cfgW,nl)+"\n\n"+L(nl,"از دکمه‌های پایین استفاده کنید:","Use the buttons below:"), {reply_markup: this.ukb(cfgW)});
+        return;
+      }
       const map={
         "📥 دریافت کانفیگ جدید":"u:getcfg",
         "دریافت کانفیگ جدید":"u:getcfg",
@@ -5495,6 +5541,16 @@ class Bot {
         "ترافیک رایگان (دعوت)":"u:referral",
         "🎁 ترافیک رایگان":"u:referral",
         "ترافیک رایگان":"u:referral",
+        "🎁 دریافت کانفیگ رایگان":"u:getcfg",
+        "دریافت کانفیگ رایگان":"u:getcfg",
+        "🎁 Get Free Config":"u:getcfg",
+        "Get Free Config":"u:getcfg",
+        "👤 My Account":"u:status",
+        "My Account":"u:status",
+        "🎁 Bonus Traffic (Invite)":"u:referral",
+        "Bonus Traffic (Invite)":"u:referral",
+        "💬 Support":"u:support",
+        "Support":"u:support",
       };
       // متن‌های سفارشی ادمین را هم بشناس (اولویت با کانفیگ)
       try{
@@ -5661,12 +5717,12 @@ class Bot {
     // Public user flow
     const s=await this.getSettings();
     if(s.publicBotEnabled===false){
-      await this.tg.msg(chat,"ربات فعلاً برای کاربران عمومی غیرفعال است.");
+      await this.tg.msg(chat,L(await this.userLang(uid),"ربات فعلاً برای کاربران عمومی غیرفعال است.","The bot is currently disabled for public users."));
       return;
     }
     const bu=await this.store.getBotUsers();
     if(bu[uid]&&bu[uid].banned){
-      await this.tg.msg(chat,"دسترسی شما مسدود شده است.");
+      await this.tg.msg(chat,L(await this.userLang(uid),"دسترسی شما مسدود شده است.","Your access is blocked."));
       return;
     }
     if(!(await this.userEnsureJoin(chat, uid))) return;
@@ -5674,8 +5730,8 @@ class Bot {
       return this.userGetConfig(chat, null, uid);
     }
     const cfg=await this.store.getPublicCfg();
-    const welcome=(cfg.welcomeText||"خوش آمدید.").replace(/\\n/g,"\n");
-    await this.tg.msg(chat, welcome+"\n\nاز دکمه‌های پایین استفاده کنید:", {reply_markup: this.ukb()});
+    const _w0=await this.userLang(uid);
+    await this.tg.msg(chat, this._welcomeFor(cfg,_w0)+"\n\n"+L(_w0,"از دکمه‌های پایین استفاده کنید:","Use the buttons below:"), {reply_markup: await this.ukbFor(uid)});
   }
 
   // ---- Main Menu ----
@@ -5947,11 +6003,11 @@ class Bot {
     let bu=null;
     try{ bu=(await this.store.getBotUsers())[uid]; }catch{}
     if(bu&&bu.banned){
-      return this.editOrSend(chat,mid,"دسترسی شما مسدود شده است.",kb([]));
+      return this.editOrSend(chat,mid,L(await this.userLang(uid),"دسترسی شما مسدود شده است.","Your access is blocked."),kb([]));
     }
     const s=await this.getSettings();
     if(s.publicBotEnabled===false){
-      return this.editOrSend(chat,mid,"ربات عمومی فعلاً خاموش است.",kb([]));
+      return this.editOrSend(chat,mid,L(await this.userLang(uid),"ربات عمومی فعلاً خاموش است.","The public bot is currently off."),kb([]));
     }
     // کش کانفیگ عمومی را گرم کن تا this.ukb() دکمه‌های سفارشی را ببیند
     try{ await this.store.getPublicCfg(); }catch{}
@@ -5962,15 +6018,16 @@ class Bot {
         if(cb && cb.id && cb.id!=="0"){
           try{ await this.tg.answer(cb.id, plainAlert(L(await this.lang(),"✅ عضویت تأیید شد","✅ Membership confirmed"))); this._cbAnswered=true; }catch{}
         }
-        await this.editOrSend(chat,mid,(cfg.welcomeText||"خوش آمدید.")+"\n\nمنوی کاربر:");
-        await this.tg.msg(chat, "از دکمه‌های پایین استفاده کنید:", {reply_markup: await this.ukbFor(uid)});
+        const _wl=await this.userLang(uid);
+        await this.editOrSend(chat,mid,this._welcomeFor(cfg,_wl)+"\n\n"+L(_wl,"منوی کاربر:","User menu:"));
+        await this.tg.msg(chat, L(_wl,"از دکمه‌های پایین استفاده کنید:","Use the buttons below:"), {reply_markup: await this.ukbFor(uid)});
         return;
       }
       // ❌ هنوز عضو نیست — قبلاً هیچ پاسخی داده نمی‌شد و دکمه «مرده» به نظر می‌رسید.
       // پاپ‌آپ هشدار + پیام متنی، تا در هر دو مسیر (دکمه و کیبورد) بازخورد دیده شود.
       try{
         const cfg2=await this.store.getPublicCfg();
-        const lang2=await this.lang();
+        const lang2=await this.userLang(uid);
         const info2=this._joinInfo || await this.joinChatInfo(String(cfg2.forceChannelId||"").trim());
         const deny=joinDeniedText(cfg2, info2, lang2);
         if(cb && cb.id && cb.id!=="0"){
@@ -5983,8 +6040,9 @@ class Bot {
     }
     if(!(await this.userEnsureJoin(chat, uid, mid))) return;
     if(d==="u:menu") {
-      await this.editOrSend(chat,mid,"منوی کاربر:");
-      await this.tg.msg(chat, "از دکمه‌های پایین استفاده کنید:", {reply_markup: this.ukb()});
+      const _mu=await this.userLang(uid);
+      await this.editOrSend(chat,mid,L(_mu,"منوی کاربر:","User menu:"));
+      await this.tg.msg(chat, L(_mu,"از دکمه‌های پایین استفاده کنید:","Use the buttons below:"), {reply_markup: this.ukb()});
       return;
     }
     if(d==="u:getcfg") return this.userGetConfig(chat, mid, uid);
@@ -5992,13 +6050,13 @@ class Bot {
     if(d==="u:status") return this.userStatus(chat, mid, uid);
     if(d==="u:referral") {
       const rc0=await this._referralCfg();
-      if(!rc0.enabled) return this.editOrSend(chat,mid,"🎁 دعوت دوستان فعلاً در دسترس نیست.", kb([[btn("◀ منو","u:menu")]]));
+      if(!rc0.enabled) return this.editOrSend(chat,mid,L(await this.userLang(uid),"🎁 دعوت دوستان فعلاً در دسترس نیست.","🎁 Invites are currently unavailable."), kb([[btn("◀ منو","u:menu")]]));
       return this.cmdReferral(chat, mid, uid);
     }
     // 🎛 انتخاب کاربر: هدیه الان خرج شود یا ذخیره بماند
     if(d.startsWith("u:refhold:")) {
       const rc0=await this._referralCfg();
-      if(!rc0.enabled) return this.editOrSend(chat,mid,"🎁 دعوت دوستان فعلاً در دسترس نیست.", kb([[btn("◀ منو","u:menu")]]));
+      if(!rc0.enabled) return this.editOrSend(chat,mid,L(await this.userLang(uid),"🎁 دعوت دوستان فعلاً در دسترس نیست.","🎁 Invites are currently unavailable."), kb([[btn("◀ منو","u:menu")]]));
       return this.userSetBonusHold(chat, mid, uid, d.slice("u:refhold:".length) === "1");
     }
     if(d==="u:support") return this.userSupportStart(chat, mid, uid);
@@ -7894,7 +7952,7 @@ class Bot {
     if(active && active.reachable===false && !active.notFound){
       await this.tg.call("sendMessage",{
         chat_id:chat,
-        text:"⚠️ سرور کانفیگ شما موقتاً در دسترس نیست و انتقال خودکار انجام نشد.\nحجم و اعتبارتان محفوظ است — کمی بعد دوباره تلاش کنید.",
+        text:L(await this.userLang(uid),"⚠️ سرور کانفیگ شما موقتاً در دسترس نیست و انتقال خودکار انجام نشد.\nحجم و اعتبارتان محفوظ است — کمی بعد دوباره تلاش کنید.","⚠️ Your config's server is temporarily unavailable and auto-migration failed.\nYour volume and validity are safe — try again shortly."),
         reply_markup:this.ukb()
       });
       return;
@@ -7923,14 +7981,14 @@ class Bot {
         n=await sendConfigLinks(this.tg, chat, links, migTxt||null, true);
       }
       if(!n){
-        await this.tg.call("sendMessage",{chat_id:chat, text:(migTxt?migTxt+"\n\n":"")+"لینک اتصال الان آماده نیست. کمی بعد از «کانفیگ‌های من» دوباره تلاش کنید.", parse_mode:migTxt?"Markdown":undefined, reply_markup:this.ukb(), disable_web_page_preview:true});
+        await this.tg.call("sendMessage",{chat_id:chat, text:(migTxt?migTxt+"\n\n":"")+L(await this.userLang(uid),"لینک اتصال الان آماده نیست. کمی بعد دوباره «🎁 دریافت کانفیگ رایگان» را بزنید.","Link is not ready yet. Tap \"🎁 Get Free Config\" again shortly."), parse_mode:migTxt?"Markdown":undefined, reply_markup:this.ukb(), disable_web_page_preview:true});
       }
       return;
     }
 
         // 🚫 خواندن نامشخص → توقف امن (نه صدور، نه پاک‌سازی)
     if(active && active.readFail){
-      await this.tg.call("sendMessage",{chat_id:chat, text:"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.", reply_markup:this.ukb()});
+      await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.","⚠️ Service is temporarily unavailable.\nYour subscription was not deleted — please try again shortly."), reply_markup:this.ukb()});
       return;
     }
     // 🪦 قفل دورهٔ قبلی: رکورد ممکن است پاک شده باشد ولی دوره هنوز تمام نشده —
@@ -7938,19 +7996,19 @@ class Bot {
     if(!active || !active.client || active.notFound){
       const _tLock=await this._lastAcctLock(uid);
       if(_tLock>Date.now()+30000){
-        const _langL=await this.lang();
+        const _langL=await this.userLang(uid);
         // f6: کوتاه و شفاف — کاربر فقط باید بداند «کِی دوباره بزند»
         await this.tg.msg(chat,
           L(_langL,"⏳ *اشتراک فعلی شما هنوز فعال است*","⏳ *Your current plan is still active*")+"\n\n"+
           L(_langL,"📅 پایان: *","📅 Ends: *")+fmtDateTimeFa(_tLock)+"* "+L(_langL,"("+fmtRemain(_tLock-Date.now(),_langL)+" مانده)","("+fmtRemain(_tLock-Date.now(),_langL)+" left)")+"\n\n"+
-          L(_langL,"بعد از این تاریخ، دوباره «دریافت کانفیگ جدید» را بزنید.","After this date, tap \"Get new config\" again."),
+          L(_langL,"بعد از این تاریخ، دوباره «🎁 دریافت کانفیگ رایگان» را بزنید.","After this date, tap \"🎁 Get Free Config\" again."),
           {reply_markup:this.ukb(), disable_web_page_preview:true});
         return;
       }
     }
 
 if(active && active.reachable && active.client && !active.expired && !active.notFound){
-      const lang=await this.lang();
+      const lang=await this.userLang(uid);
       // مصرف تازه برای همین نمایش (مسیر تعاملی است، پس trafficOf اشکالی ندارد)
       const _cl=active.client;
       let _tr=getTraffic(_cl);
@@ -7988,8 +8046,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           "⏳ Time left: *"+fmtRemain(_exp-_now,lang)+"* (until *"+fmtDateTimeFa(_exp)+")"));
         lines.push("");
         lines.push(L(lang,
-          "بعد از پایان زمان، «دریافت کانفیگ جدید» را بزنید.",
-          "When the time ends, tap “Get new config”."));
+          "بعد از پایان زمان، «🎁 دریافت کانفیگ رایگان» را بزنید.",
+          "When the time ends, tap “🎁 Get Free Config”."));
       } else {
         lines.push(L(lang,"✅ *اشتراک شما فعال است*","✅ *Your subscription is active*"));
         lines.push(uiSep());
@@ -8005,11 +8063,18 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           lines.push(L(lang,"⏳ اعتبار زمانی: *نامحدود*","⏳ Time validity: *unlimited*"));
         }
         lines.push("");
-        lines.push(L(lang,"🔗 لینک اتصال در «کانفیگ‌های من» است.",
-             "🔗 Your connection link is in “My configs”."));
+        if(_exp>_now){
+          lines.push(L(lang,"⏳ زمان دریافت کانفیگ جدید: *","⏳ Next free config: *")+fmtDateTimeFa(_exp)+"*"
+            +"  ("+L(lang,"بعد از پایان این اشتراک","after this plan ends")+")");
+        }
       }
       // tg.msg (نه call خام): parse_mode با fallback، تا *ها واقعاً بولد شوند
       await this.tg.msg(chat, lines.join("\n"), {reply_markup:this.ukb(), disable_web_page_preview:true});
+      // 🎁 f28: دکمهٔ دریافت = ارسال دوبارهٔ «همین» کانفیگِ فعال کاربر
+      try{
+        const _lnk=await active.api.getClientConfigLinks(active.email);
+        if(_lnk&&_lnk.length) await sendConfigLinks(this.tg, chat, _lnk, null, true);
+      }catch{}
       // 🔴 d50: ضامن هشدار ۸۰٪ در مسیر تعاملی — اگر کرون به هر دلیلی (قفل،
       // بودجهٔ subrequest، پنل لیستِ بدون-ترافیک) جا مانده باشد، همین‌جا که
       // کاربر خودش دکمه را زده و مصرف تازه در دست است، یک‌بار هشدار بده.
@@ -8062,16 +8127,19 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const allowP=new Set((cfg.publicPlanIds||[]).map(String));
     if(allowP.size) plans=plans.filter(p=>allowP.has(String(p.id)));
     if(!plans.length){
-      return this.editOrSend(chat,mid,"الان طرح فعالی برای دریافت اشتراک وجود ندارد.\nلطفاً کمی بعد دوباره تلاش کنید.");
+      return this.editOrSend(chat,mid,L(await this.userLang(uid),"الان طرح فعالی برای دریافت اشتراک وجود ندارد.\nلطفاً کمی بعد دوباره تلاش کنید.","No plans are available right now.\nPlease try again shortly."));
     }
+    const lang9=await this.userLang(uid);
     const rows=plans.map(p=>[btn(p.name+" — "+fmtPlanQuota(p.trafficGB,p.days),"u:plan:"+p.id)]);
-    rows.push([btn("◀ منو","u:menu")]);
-    // f6: کوتاه و قابل‌فهم — قانون به‌جای هشدار منفی، توضیح یک‌خطی
+    rows.push([btn(L(lang9,"◀ منو","◀ Menu"),"u:menu")]);
+    // ✍️ f28: متن جدید صفحهٔ انتخاب (خواستهٔ میدانی — بولد)
     const text = [
-      "📦 *انتخاب اشتراک*",
+      L(lang9,"📦 *انتخاب اشتراک*","📦 *Choose a plan*"),
       uiSep(),
-      "هر طرح شامل *حجم و زمان* است و هر دو با هم تمام می‌شوند.",
-      "یکی را انتخاب کنید تا کانفیگ ساخته شود:",
+      "",
+      L(lang9,"*تا زمان پایان اشتراک فعلی نمیشه اشتراک جدید گرفت.*","*You can\u2019t get a new plan until your current one ends.*"),
+      "",
+      L(lang9,"*یکی را انتخاب کنید تا کانفیگ ساخته شود:*","*Pick one and your config will be created:*"),
     ].join("\n");
     return this.editOrSend(chat,mid,text, kb(rows));
   }
@@ -8141,7 +8209,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         await this._restoreUrlRefresh(uid);
         await this.tg.call("sendMessage",{
           chat_id:chat,
-          text:"⚠️ الان نتوانستیم کانفیگ را از سرور بخوانیم. کمی بعد دوباره «دریافت کانفیگ جدید» را بزنید — حجم و اعتبارتان محفوظ است.",
+          text:L(await this.userLang(uid),"⚠️ الان نتوانستیم کانفیگ را از سرور بخوانیم. کمی بعد دوباره «🎁 دریافت کانفیگ رایگان» را بزنید — حجم و اعتبارتان محفوظ است.","⚠️ Could not read the config from the server. Tap \"🎁 Get Free Config\" again shortly — your volume and validity are safe."),
           reply_markup:this.ukb()
         });
         return;
@@ -8150,7 +8218,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       if(!cl){
         await this.tg.call("sendMessage",{
           chat_id:chat,
-          text:"کانفیگ فعالی روی این سرور پیدا نشد.\nاز دکمه «دریافت کانفیگ جدید» یک کانفیگ تازه بگیرید.",
+          text:L(await this.userLang(uid),"کانفیگ فعالی روی این سرور پیدا نشد.\nاز دکمهٔ «🎁 دریافت کانفیگ رایگان» یک کانفیگ تازه بگیرید.","No active config found on this server.\nGet a fresh one via \"🎁 Get Free Config\"."),
           reply_markup:this.ukb()
         });
         return;
@@ -8161,7 +8229,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       if(exp && exp<=now){
         await this.tg.call("sendMessage",{
           chat_id:chat,
-          text:"اعتبار اشتراک شما به پایان رسیده.\nاز دکمهٔ «دریافت کانفیگ جدید» دوباره اشتراک بگیرید.",
+          text:L(await this.userLang(uid),"اعتبار اشتراک شما به پایان رسیده.\nاز دکمهٔ «🎁 دریافت کانفیگ رایگان» دوباره اشتراک بگیرید.","Your plan has expired.\nGet a new one via \"🎁 Get Free Config\"."),
           reply_markup:this.ukb()
         });
         return;
@@ -8213,7 +8281,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         await this._restoreUrlRefresh(uid);
         await this.tg.call("sendMessage",{
           chat_id:chat,
-          text:refTxt+"\n\nلینک‌ها ارسال نشدند — کمی بعد دوباره «دریافت کانفیگ جدید» را بزنید.",
+          text:refTxt+"\n\n"+L(await this.userLang(uid),"لینک‌ها ارسال نشدند — کمی بعد دوباره «🎁 دریافت کانفیگ رایگان» را بزنید.","Links could not be sent — tap \"🎁 Get Free Config\" again shortly."),
           parse_mode:"Markdown",
           reply_markup: await this.ukbFor(uid),
           disable_web_page_preview:true
@@ -8655,13 +8723,13 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       const active=await this.userFindActiveAccount(uid, {publicOnly:false});
       // 🚫 خواندن نامشخص → صدور جدید متوقف (وگرنه کانفیگ دوبله ساخته می‌شود)
       if(active && active.readFail){
-        return say("⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک قبلی شما حذف نشده — کمی بعد دوباره تلاش کنید.");
+        return say(L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک قبلی شما حذف نشده — کمی بعد دوباره تلاش کنید.","⚠️ Service is temporarily unavailable.\nYour previous subscription was not deleted — please try again shortly."));
       }
       // 🪦 قفل دورهٔ قبلی — حتی اگر رکورد به هر دلیلی پاک شده باشد
       if(!active || !active.client || active.notFound || active.expired){
         const _tLockC=await this._lastAcctLock(uid);
         if(_tLockC>Date.now()+30000){
-          return say("⏳ *اشتراک فعلی شما هنوز فعال است*\n\n📅 پایان: *"+fmtDateTimeFa(_tLockC)+"*\n\nبعد از این تاریخ، دوباره «دریافت کانفیگ جدید» را بزنید.");
+          return say(L(await this.userLang(uid),"⏳ *اشتراک فعلی شما هنوز فعال است*\n\n📅 پایان: *"+fmtDateTimeFa(_tLockC)+"*\n\nبعد از این تاریخ، دوباره «🎁 دریافت کانفیگ رایگان» را بزنید.","⏳ *Your current plan is still active*\n\n📅 Ends: *"+fmtDateTimeFa(_tLockC)+"*\n\nAfter that, tap \"🎁 Get Free Config\" again."));
         }
       }
       if(active && active.reachable && active.client && !active.expired){
@@ -8674,9 +8742,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           const _e2=tsMs(Number(_c2.expiryTime||0)||0);
           if(_to2>0 && _u2>=_to2 && _e2>Date.now()){
             _why="📉 حجم این دوره‌تان تمام شده ("+fmtGib(_u2)+" از "+fmtGib(_to2)+" گیگ) — زمانش هنوز باقی است.\n"
-              +"📅 پایان دوره: *"+fmtDateTimeFa(_e2)+"* — بعد از این تاریخ دوباره «دریافت کانفیگ جدید» را بزنید.";
+              +"📅 پایان دوره: *"+fmtDateTimeFa(_e2)+"* — بعد از این تاریخ دوباره «🎁 دریافت کانفیگ رایگان» را بزنید.";
           } else if(_e2>Date.now()){
-            _why="شما هنوز اشتراک فعال دارید.\n📅 پایان دوره: *"+fmtDateTimeFa(_e2)+"* — بعد از این تاریخ می‌توانید دوباره بگیرید.";
+            _why=L(await this.userLang(uid),"شما هنوز اشتراک فعال دارید.\n📅 پایان دوره: *"+fmtDateTimeFa(_e2)+"* — بعد از این تاریخ می‌توانید دوباره بگیرید.","You still have an active plan.\n📅 Period ends: *"+fmtDateTimeFa(_e2)+"* — you can get a new one after that.");
           }
         }catch{}
         return say(_why);
@@ -9041,6 +9109,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
 
   async userSupportStart(chat, mid, uid) {
+    const _ls=await this.userLang(uid);
     if(!(await this.userEnsureJoin(chat, uid, mid))) return;
     try{
       await this.store.setState(String(uid), "user_support", {});
@@ -9048,29 +9117,30 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       // جزئیات خطا فقط در لاگ سرور — به کاربر عمومی نشت نکند
       console.error("userSupportStart setState", e&&e.message);
       try{ await this.addLog("user_support_err", String((e&&e.message)||e).slice(0,200), uid); }catch{}
-      await this.editOrSend(chat,mid,"❌ ارسال پیام موقتاً ممکن نیست. کمی بعد دوباره تلاش کنید.", this.ukb());
+      await this.editOrSend(chat,mid,L(_ls,"❌ ارسال پیام موقتاً ممکن نیست. کمی بعد دوباره تلاش کنید.","❌ Messaging is temporarily unavailable. Please try again shortly."), this.ukb());
       return;
     }
     await this.editOrSend(chat, mid,
-      "💬 *پشتیبانی*\n" +
+      L(_ls,"💬 *پشتیبانی*","💬 *Support*")+"\n" +
       "────────────\n" +
-      "پیام، عکس یا فایل خود را همین‌جا بفرستید.\n" +
-      "پاسخ مدیران در همین گفتگو به شما می‌رسد.\n\n" +
-      "وقتی کارتان تمام شد، «اتمام گفتگو» را بزنید.",
+      L(_ls,"پیام، عکس یا فایل خود را همین‌جا بفرستید.","Send your message, photo or file right here.")+"\n" +
+      L(_ls,"پاسخ مدیران در همین گفتگو به شما می‌رسد.","Admins will reply to you in this chat.")+"\n\n" +
+      L(_ls,"وقتی کارتان تمام شد، «اتمام گفتگو» را بزنید.","When you\u2019re done, tap \"End chat\"."),
       kb([
-        [btn("❌ اتمام گفتگو","u:support_cancel")]
+        [btn(L(_ls,"❌ اتمام گفتگو","❌ End chat"),"u:support_cancel")]
       ])
     );
   }
 
   _supportKb(n) {
+    const _skl=this._ulang==="en"?"en":"fa";
     return kb([
-      [btn("❌ اتمام گفتگو","u:support_cancel")]
+      [btn(L(_skl,"❌ اتمام گفتگو","❌ End chat"),"u:support_cancel")]
     ]);
   }
 
   async userSupportCollect(msg) {
-    const lang=await this.lang();
+    const lang=await this.userLang(String(msg.from.id));
     const uid = String(msg.from.id);
     const chat = msg.chat.id;
     const from = msg.from || {};
@@ -9721,14 +9791,14 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const active=await this.userResolveAccount(uid, {allowMigrate:true, syncInbounds:true, forcePublic:true, chat});
     // 🚫 خواندن پنل نامشخص بود → هیچ تصمیمی روی دادهٔ ناقص؛ حساب دست‌نخورده می‌ماند
     if(active && active.readFail){
-      await this.tg.call("sendMessage",{chat_id:chat, text:"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.", reply_markup:this.ukb()});
+      await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.","⚠️ Service is temporarily unavailable.\nYour subscription was not deleted — please try again shortly."), reply_markup:this.ukb()});
       return;
     }
     // پنل خوابیده و اسنپ‌شاتی برای انتقال نبود → حساب را پاک نکن
     if(active && active.reachable===false && !active.client && !active.notFound){
       await this.tg.call("sendMessage",{
         chat_id:chat,
-        text:"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.",
+        text:L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.","⚠️ Service is temporarily unavailable.\nYour subscription was not deleted — please try again shortly."),
         reply_markup:this.ukb()
       });
       return;
@@ -9758,14 +9828,14 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         const _hasMapM=!!(_buM && _buM.email && _buM.panelId!=null);
         const _tLockM=await this._lastAcctLock(uid);
         if(!_hasMapM && _tLockM<=Date.now()+30000){
-          await this.tg.call("sendMessage",{chat_id:chat, text:"هنوز اشتراکی ندارید.\nاز دکمهٔ «دریافت کانفیگ جدید» یک اشتراک فعال کنید.", reply_markup:this.ukb()});
+          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🎁 Get Free Config\" to start."), reply_markup:this.ukb()});
           return;
         }
         if(_tLockM>Date.now()+30000){
-          await this.tg.call("sendMessage",{chat_id:chat, text:"⏳ اشتراک فعلی شما هنوز فعال است.\nبعد از پایان آن، «دریافت کانفیگ جدید» را بزنید.", reply_markup:this.ukb()});
+          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⏳ اشتراک فعلی شما هنوز فعال است.\nبعد از پایان آن، «🎁 دریافت کانفیگ رایگان» را بزنید.","⏳ Your current plan is still active.\nAfter it ends, tap \"🎁 Get Free Config\"."), reply_markup:this.ukb()});
           return;
         }
-        await this.tg.call("sendMessage",{chat_id:chat, text:"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.", reply_markup:this.ukb()});
+        await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.","⚠️ Service is temporarily unavailable.\nYour subscription was not deleted — please try again shortly."), reply_markup:this.ukb()});
         return;
       } else {
         // تأییدشده: کلاینت روی پنل سالم نیست
@@ -9782,9 +9852,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           if(_hadTime){
             // دوره هنوز تمام نشده ⇒ تا پایانش قفل می‌ماند + هشدار به ادمین
             try{ await this.notifyOwner("⚠️ کاربر «"+String((active&&active.email)||uid)+"» روی پنل پیدا نشد و بازیابی خودکار هم ناموفق بود — تا پایان دوره قفل شد.", "lost:"+String((active&&active.email)||uid), 3600); }catch{}
-            await this.tg.call("sendMessage",{chat_id:chat, text:"⚠️ اشتراک شما در حال حاضر قابل بازیابی نیست.\nتا پایان دورهٔ فعلی امکان اشتراک جدید نیست — لطفاً با پشتیبانی در تماس باشید.", reply_markup:this.ukb()});
+            await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⚠️ اشتراک شما در حال حاضر قابل بازیابی نیست.\nتا پایان دورهٔ فعلی امکان اشتراک جدید نیست — لطفاً با پشتیبانی در تماس باشید.","⚠️ Your subscription cannot be recovered right now.\nNo new plan until this period ends — please contact support."), reply_markup:this.ukb()});
           } else {
-            await this.tg.call("sendMessage",{chat_id:chat, text:"هنوز اشتراکی ندارید.\nاز دکمهٔ «دریافت کانفیگ جدید» یک اشتراک فعال کنید.", reply_markup:this.ukb()});
+            await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🎁 Get Free Config\" to start."), reply_markup:this.ukb()});
           }
           return;
         }
@@ -9838,7 +9908,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     if(active && active.reachable===false && !active.notFound){
       await this.tg.call("sendMessage",{
         chat_id:chat,
-        text:"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید یا از «کانفیگ‌های من» لینک را بگیرید.",
+        text:L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید یا «🎁 دریافت کانفیگ رایگان» را بزنید.","⚠️ Service is temporarily unavailable.\nYour subscription was not deleted — try again shortly or tap \"🎁 Get Free Config\"."),
         reply_markup:this.ukb()
       });
       return;
@@ -9868,14 +9938,14 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         const _hasMapM=!!(_buM && _buM.email && _buM.panelId!=null);
         const _tLockM=await this._lastAcctLock(uid);
         if(!_hasMapM && _tLockM<=Date.now()+30000){
-          await this.tg.call("sendMessage",{chat_id:chat, text:"هنوز اشتراکی ندارید.\nاز دکمهٔ «دریافت کانفیگ جدید» یک اشتراک فعال کنید.", reply_markup:this.ukb()});
+          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🎁 Get Free Config\" to start."), reply_markup:this.ukb()});
           return;
         }
         if(_tLockM>Date.now()+30000){
-          await this.tg.call("sendMessage",{chat_id:chat, text:"⏳ اشتراک فعلی شما هنوز فعال است.\nبعد از پایان آن، «دریافت کانفیگ جدید» را بزنید.", reply_markup:this.ukb()});
+          await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⏳ اشتراک فعلی شما هنوز فعال است.\nبعد از پایان آن، «🎁 دریافت کانفیگ رایگان» را بزنید.","⏳ Your current plan is still active.\nAfter it ends, tap \"🎁 Get Free Config\"."), reply_markup:this.ukb()});
           return;
         }
-        await this.tg.call("sendMessage",{chat_id:chat, text:"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.", reply_markup:this.ukb()});
+        await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⚠️ سرویس موقتاً در دسترس نیست.\nاشتراک شما حذف نشده — کمی بعد دوباره تلاش کنید.","⚠️ Service is temporarily unavailable.\nYour subscription was not deleted — please try again shortly."), reply_markup:this.ukb()});
         return;
       } else {
         // تأییدشده: کلاینت روی پنل سالم نیست
@@ -9892,18 +9962,25 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           if(_hadTime){
             // دوره هنوز تمام نشده ⇒ تا پایانش قفل می‌ماند + هشدار به ادمین
             try{ await this.notifyOwner("⚠️ کاربر «"+String((active&&active.email)||uid)+"» روی پنل پیدا نشد و بازیابی خودکار هم ناموفق بود — تا پایان دوره قفل شد.", "lost:"+String((active&&active.email)||uid), 3600); }catch{}
-            await this.tg.call("sendMessage",{chat_id:chat, text:"⚠️ اشتراک شما در حال حاضر قابل بازیابی نیست.\nتا پایان دورهٔ فعلی امکان اشتراک جدید نیست — لطفاً با پشتیبانی در تماس باشید.", reply_markup:this.ukb()});
+            await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"⚠️ اشتراک شما در حال حاضر قابل بازیابی نیست.\nتا پایان دورهٔ فعلی امکان اشتراک جدید نیست — لطفاً با پشتیبانی در تماس باشید.","⚠️ Your subscription cannot be recovered right now.\nNo new plan until this period ends — please contact support."), reply_markup:this.ukb()});
           } else {
-            await this.tg.call("sendMessage",{chat_id:chat, text:"هنوز اشتراکی ندارید.\nاز دکمهٔ «دریافت کانفیگ جدید» یک اشتراک فعال کنید.", reply_markup:this.ukb()});
+            await this.tg.call("sendMessage",{chat_id:chat, text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🎁 Get Free Config\" to start."), reply_markup:this.ukb()});
           }
           return;
         }
       }
     }
+    // 🎁 f28: کانفیگ منقضی = «کانفیگ فعال ندارید» — آمار قدیمی نشان داده نشود
+    if(active.expired){
+      await this.tg.call("sendMessage",{chat_id:chat,
+        text:L(await this.userLang(uid),"شما کانفیگ فعال ندارید.\nبرای شروع، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.","You don\u2019t have an active config.\nTap \"🎁 Get Free Config\" to start."),
+        reply_markup:this.ukb()});
+      return;
+    }
     if(active.reachable===false){
       await this.tg.call("sendMessage",{
         chat_id:chat,
-        text:"⚠️ اتصال قبلی در دسترس نیست.\nاگر لینک کار نمی‌کند، «کانفیگ‌های من» را بزنید تا در صورت امکان لینک تازه برایتان ساخته شود.",
+        text:L(await this.userLang(uid),"⚠️ اتصال قبلی در دسترس نیست.\nاگر لینک کار نمی‌کند، «🎁 دریافت کانفیگ رایگان» را بزنید تا در صورت امکان لینک تازه برایتان ساخته شود.","⚠️ Previous connection is unreachable.\nIf the link doesn\u2019t work, tap \"🎁 Get Free Config\" to get a fresh link if possible."),
         reply_markup:this.ukb()
       });
       return;
@@ -9922,7 +9999,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       if(left<=0) timeLine="منقضی شده";
       else timeLine=fmtRemain(left);
     }
-    const lang=await this.lang();
+    const lang=await this.userLang(uid);
     const st = active.expired
       ? L(lang,"🔴 اشتراک منقضی شده","🔴 Subscription expired")
       : L(lang,"🟢 اشتراک فعال","🟢 Subscription active");
@@ -9999,10 +10076,10 @@ if(active && active.reachable && active.client && !active.expired && !active.not
 
     lines.push("");
     if(active.expired){
-      lines.push(L(lang,"برای تمدید، دکمهٔ «دریافت کانفیگ جدید» را بزنید.",
+      lines.push(L(lang,"برای تمدید، دکمهٔ «🎁 دریافت کانفیگ رایگان» را بزنید.",
                        "To renew, tap “Get new config”."));
     } else {
-      lines.push(L(lang,"لینک اتصال در دکمهٔ «کانفیگ‌های من» است.",
+      lines.push(L(lang,"لینک اتصال از دکمهٔ «🎁 دریافت کانفیگ رایگان» قابل دریافت است.",
                        "Your connection link is in “My configs”."));
     }
     await this.tg.call("sendMessage",{chat_id:chat, text:lines.join("\n"), reply_markup:this.ukb(), disable_web_page_preview:true});
@@ -10352,7 +10429,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
    * صفحه «🎁 ترافیک رایگان (دعوت)» برای کاربر عمومی.
    */
   async cmdReferral(chat, mid, uid) {
-    const lang = await this.lang();
+    const lang = await this.userLang(uid);
     if (!(await this.userEnsureJoin(chat, uid, mid))) return;
 
     const r = await this._referralSummary(uid);
@@ -10475,7 +10552,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
    * ⚠️ هدیه پاک نمی‌شود؛ فقط زمان مصرفش عوض می‌شود.
    */
   async userSetBonusHold(chat, mid, uid, hold) {
-    const lang = await this.lang();
+    const lang = await this.userLang(uid);
     let bonus = 0;
     try {
       await this.store.withBotUsers((users) => {
@@ -10563,7 +10640,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         (saved.bonusHold === true
           ? L(lang, "🔒 حالت *ذخیره* روشن است؛ روی کانفیگ بعدی اعمال نمی‌شود.\nبرای تغییر: «🎁 ترافیک رایگان».",
                     "🔒 *Save* mode is on; it won't apply to your next config.\nChange it in “🎁 Free traffic”.")
-          : L(lang, "برای استفاده، «📥 دریافت کانفیگ جدید» را بزنید.", "Tap “📥 Get new config” to use it."))
+          : L(lang, "برای استفاده، «🎁 دریافت کانفیگ رایگان» را بزنید.", "Tap “🎁 Get Free Config” to use it."))
       );
     } catch {}
 
@@ -11042,7 +11119,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const cfg = await this.store.getPublicCfg();
     const on = cfg.urlRefreshTextEnabled !== false;
     const previewBtn = (() => {
-      try { return String(userButtonsFrom(cfg).getcfg.text || "").trim() || "🚀 دریافت کانفیگ جدید"; }
+      try { return String(userButtonsFrom(cfg).getcfg.text || "").trim() || "🎁 دریافت کانفیگ رایگان"; }
       catch { return "🚀 دریافت کانفیگ جدید"; }
     })();
     const cur = urlRefreshNoticeText(cfg, previewBtn);
@@ -16004,7 +16081,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       const cfg = await this.store.getPublicCfg();
       const getLbl = (() => {
         try {
-          let s = String(userButtonsFrom(cfg).getcfg.text || "").trim() || "🚀 دریافت کانفیگ جدید";
+          let s = String(userButtonsFrom(cfg).getcfg.text || "").trim() || "🎁 دریافت کانفیگ رایگان";
           return s.replace(/[*_`\[\]]/g, "");
         } catch { return "🚀 دریافت کانفیگ جدید"; }
       })();
@@ -16854,7 +16931,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     try{
       const getLbl=(()=>{
         try{
-          let s=String(userButtonsFrom(cfg).getcfg.text||"").trim() || "🚀 دریافت کانفیگ جدید";
+          let s=String(userButtonsFrom(cfg).getcfg.text||"").trim() || "🎁 دریافت کانفیگ رایگان";
           return s.replace(/[*_`\[\]]/g, "");
         }catch{ return "🚀 دریافت کانفیگ جدید"; }
       })();
