@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f26";
+const CODE_STAMP = "2026-09-19-f27";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -5009,7 +5009,8 @@ class Bot {
     //    باز کند (مثل عکس نمونه)؛ نمای متنیِ تفصیلی پشت «آمار پنل‌ها» رفت.
     if(d==="m:stats") return this.cmdStatsPlanPie(chat,mid);
     if(d==="stats:detail") return this.cmdStats(chat,mid);
-    if(d==="stats:plans") return this.cmdStatsPlanPie(chat,mid);
+    if(d==="stats:plans") return this.cmdStatsPlanPie(chat,mid,"live");
+    if(d==="stats:plans:all") return this.cmdStatsPlanPie(chat,mid,"all");
     if(d==="stats:panels") return this.cmdStatsPanels(chat,mid);
     if(d.startsWith("stats:ib:")) return this.cmdStatsInbounds(chat,mid,d.substring(9));
     if(d==="m:online") return this.cmdOnline(chat,mid);
@@ -5836,7 +5837,16 @@ class Bot {
     const tx=await this.adminHomeText(id, lang, true);
     let usedMid=mid;
     if(mid){
-      try{ await this.tg.edit(chat,mid,tx,{reply_markup:menu}); }catch(e){ /* message is not modified و… */ }
+      // 🔴 f27: editMessageText روی پیام‌های عکس (مثل نمودار 🥧 آمار) شکست
+      //    می‌خورد و قبلاً بی‌صدا بلعیده می‌شد ⇒ دکمهٔ «🏠 خانه» هیچ کاری
+      //    نمی‌کرد. حالا: edit نشد ⇒ پیام پاک و خانهٔ تازه فرستاده می‌شود.
+      const r=await this.tg.edit(chat,mid,tx,{reply_markup:menu}).catch(()=>null);
+      if(r&&r.ok){ usedMid=mid; }
+      else{
+        try{ await this.tg.call("deleteMessage",{chat_id:chat,message_id:mid}); }catch{}
+        const sent=await this.tg.msg(chat,tx,{reply_markup:menu});
+        usedMid=sent && sent.result && sent.result.message_id;
+      }
     } else {
       const sent=await this.tg.msg(chat,tx,{reply_markup:menu});
       usedMid=sent && sent.result && sent.result.message_id;
@@ -12992,7 +13002,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const lang = await this.lang();
     let st=null;
     try{ st=await this._planUsageStats(); }catch{}
-    if(st && await this._planPieSend(chat, mid, st, lang, mode==="all"?"all":"live")) return;
+    if(st && await this._planPieSend(chat, mid, st, lang, mode==="all"?"all":"live", "pub:planstats")) return;
     return this.cmdPublicPlanStatsText(chat,mid);
   }
 
@@ -13042,8 +13052,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
 
   /** ساخت + ارسال عکس 🥧 از دادهٔ آمار قالب. true=عکس رفت */
-  async _planPieSend(chat, mid, st, lang, mode) {
+  async _planPieSend(chat, mid, st, lang, mode, cbBase) {
     try{
+      cbBase=cbBase||"pub:planstats";   // مسیر عمومی | "stats:plans" = بخش آمار ادمین
       const isLive = mode!=="all";
       const sum = Number(isLive?st.liveTotal:st.totalTotal)||0;
       if(sum<=0) return false;
@@ -13069,21 +13080,22 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       const pieLabels=items.map(x=>this._faShape(x.name));
       const chartJS="({type:'pie',data:{labels:"+JSON.stringify(pieLabels)+
         ",datasets:[{data:"+JSON.stringify(items.map(x=>x.value))+",backgroundColor:"+JSON.stringify(items.map((_,i)=>palette[i%palette.length]))+
-        "}]},options:{legend:{display:true,position:'bottom',labels:{color:'#ffffff',font:{size:26},boxWidth:28}},"+
-        "plugins:{datalabels:{color:'#ffffff',font:{size:28,weight:'bold'},"+
-        "formatter:(v,ctx)=>(v*100/ctx.dataset.data.reduce((a,b)=>a+b,0)).toFixed(1)+'%'}}}})";
+        "}]},options:{legend:{display:false},"+
+        "plugins:{datalabels:{color:'#ffffff',font:{size:24,weight:'bold'},"+
+        "formatter:(v,ctx)=>(v*100/ctx.dataset.data.reduce((a,b)=>a+b,0)).toFixed(1)+'%\n'+ctx.chart.data.labels[ctx.dataIndex]}}}})";
       const _qc=new AbortController(); const _qt=setTimeout(()=>_qc.abort(),15000);
       let blob=null;
       try{
         const resp=await fetch("https://quickchart.io/chart",{method:"POST",
           headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({width:640,height:660,backgroundColor:"#141a22",chart:chartJS}),
+          body:JSON.stringify({width:640,height:640,backgroundColor:"#141a22",chart:chartJS}),
           signal:_qc.signal});
         if(resp.ok) blob=await resp.blob();
       } finally { clearTimeout(_qt); }
       if(!blob||!blob.size) return false;
-      const toggleCb = isLive?"pub:planstats:all":"pub:planstats:live";
-      const refreshCb = isLive?"pub:planstats:live":"pub:planstats:all";
+      const toggleCb = cbBase+(isLive?":all":":live");
+      const refreshCb = cbBase+(isLive?":live":":all");
+      const isPub = cbBase==="pub:planstats";
       const fd=new FormData();
       fd.append("chat_id",String(chat));
       fd.append("caption",cap);
@@ -13091,8 +13103,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       fd.append("reply_markup",JSON.stringify(kb([
         [btn(isLive?("📈 "+L(lang,"کل استفاده از ابتدا","All-time usage")):("📊 "+L(lang,"فعال الان","Active now")),toggleCb),
          btn("🔄",refreshCb)],
-        [btn("📋 "+L(lang,"جزئیات کامل","Full details"),"pub:planstats:txt")],
-        [btn(L(lang,"◀ ربات عمومی","◀ Public Bot"),"m:public")],
+        [btn("📋 "+L(lang,"جزئیات کامل","Full details"), isPub?"pub:planstats:txt":"stats:detail")],
+        isPub?[btn(L(lang,"◀ ربات عمومی","◀ Public Bot"),"m:public")]:[homeBtn(lang)],
       ])));
       fd.append("photo",blob,"plans.png");
       const sr=await fetch(this.tg.base+"/sendPhoto",{method:"POST",body:fd});
@@ -13664,102 +13676,17 @@ if(active && active.reachable && active.client && !active.expired && !active.not
    * planId → lastPlanId → تطابق نام حل می‌شود؛ بدون قالب = «نامشخص».
    * اگر ساخت عکس شکست خورد (سرویس بیرونی در دسترس نبود) → نمودار متنی.
    */
-  async cmdStatsPlanPie(chat,mid) {
+  /**
+   * 🥧 f27: نمودار قالب‌های بخش «آمار» ادمین — از همان موتور دادهٔ آمار
+   * قالب‌های ربات عمومی (_planUsageStats) تغذیه می‌شود تا دو بخش «قالب»
+   * دقیقاً عدد یکسان بدهند؛ فقط دکمه‌ها (ACL ادمین) و فال‌بک متنی فرق دارد.
+   */
+  async cmdStatsPlanPie(chat,mid,mode) {
+    let st=null;
+    try{ st=await this._planUsageStats(); }catch{}
     const lang=await this.lang();
-    let plans=[], users={};
-    try{ plans=(await this.store.getPlans())||[]; }catch{}
-    try{ users=(await this.store.getBotUsers())||{}; }catch{}
-    const byKey={}; const nameOf={};
-    for(const p of plans){ const k=String(p.id); byKey[k]=0; nameOf[k]=String(p.name||"").trim()||("قالب "+k); }
-    let unmapped=0, total=0;
-    for(const id of Object.keys(users||{})){
-      const u=users[id];
-      if(!u||!u.email||u.panelId==null) continue;
-      total++;
-      let k=null;
-      for(const cand of [u.planId,u.lastPlanId,u.publicPlanId]){
-        if(cand!=null && String(cand).trim()!=="" && Object.prototype.hasOwnProperty.call(byKey,String(cand))){ k=String(cand); break; }
-      }
-      if(k==null){
-        const nm=String(u.planName||u.lastPlanName||"").trim();
-        if(nm && nm!=="migrated"){
-          const hit=plans.find(p=>String(p.name||"").trim()===nm);
-          k=hit?String(hit.id):("n:"+nm);
-          if(nameOf[k]===undefined) nameOf[k]=nm;
-          if(byKey[k]===undefined) byKey[k]=0;
-        }
-      }
-      if(k!=null) byKey[k]++; else unmapped++;
-    }
-    if(!total){
-      return this.editOrSend(chat,mid,
-        uiHead("🥧",L(lang,"آمار قالب‌ها","Plan share"),L(lang,"سهم هر قالب","Share per plan"))+"\n\n"+
-        L(lang,"هنوز کانفیگی با قالب مشخص ثبت نشده.","No plan-tagged configs yet."),
-        kb([[btn(L(lang,"📊 آمار پنل‌ها","📊 Panel stats"),"stats:detail")],[homeBtn(lang)]]));
-    }
-    const keys=Object.keys(byKey).filter(k=>byKey[k]>0);
-    const labels=keys.map(k=>nameOf[k]||k).concat(unmapped>0?[L(lang,"نامشخص","Unknown")]:[]);
-    const counts=keys.map(k=>byKey[k]).concat(unmapped>0?[unmapped]:[]);
-    const pct=c=>Math.round(c*100/total);
-    // 🛡 f24: کپشن با HTML (esc کامل) — Markdown با نام قالب‌های دارای * یا _
-    //    ارسال عکس را می‌شکست و بی‌صدا به فال‌بک متنی می‌رفت.
-    const _pieHead=esc(uiHead("🥧",L(lang,"آمار قالب‌ها","Plan share"),L(lang,"سهم هر قالب از کانفیگ‌های صادرهٔ ربات","Each plan's share of bot-issued configs")));
-    const _pieTotal="👥 "+L(lang,"مجموع:","Total:")+" <b>"+total+"</b>";
-    let _pieRows=counts.map((c,i)=>(i+1)+") "+esc(labels[i])+" — <b>"+c+"</b> ("+pct(c)+"٪)");
-    let cap=_pieHead+"\n\n"+_pieRows.join("\n")+"\n\n"+_pieTotal;
-    while(cap.length>960&&_pieRows.length>3){ _pieRows.pop(); cap=_pieHead+"\n\n"+_pieRows.join("\n")+"\n…\n\n"+_pieTotal; }
-    let sent=false;
-    try{
-      // 🎯 f24: کانفیگ به‌صورت رشتهٔ JS با POST فرستاده می‌شود — فقط در این حالت
-      //    quickchart formatter تابعی را اجرا می‌کند (٪ داخل برش مثل عکس نمونه)
-      //    و لجندِ بالا هم نمی‌آید. GET/JSON تابع را نادیده می‌گیرد.
-      const palette=["#5b9cf6","#3b6fe0","#6fc26f","#f2b544","#e05f5f","#9b6fe0","#42b8c5","#e08bb0","#8a9aa8","#c2d94c"];
-      // 🇮🇷 f26: نام قالب روی عکس با شکل‌دهی فارسی
-      const chartJS="({type:'pie',data:{labels:"+JSON.stringify(counts.map((_,i)=>this._faShape(labels[i])))+
-        ",datasets:[{data:"+JSON.stringify(counts)+",backgroundColor:"+JSON.stringify(counts.map((_,i)=>palette[i%palette.length]))+
-        "}]},options:{legend:{display:true,position:'bottom',labels:{color:'#ffffff',font:{size:26},boxWidth:28}},"+
-        "plugins:{datalabels:{color:'#ffffff',font:{size:28,weight:'bold'},"+
-        "formatter:(v,ctx)=>Math.round(v*100/ctx.dataset.data.reduce((a,b)=>a+b,0))+'%'}}}})";
-      const _qc=new AbortController(); const _qt=setTimeout(()=>_qc.abort(),15000);
-      let blob=null;
-      try{
-        const resp=await fetch("https://quickchart.io/chart",{method:"POST",
-          headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({width:640,height:660,backgroundColor:"#141a22",chart:chartJS}),
-          signal:_qc.signal});
-        if(resp.ok) blob=await resp.blob();
-        else try{ await this.addLog("plan_pie","qc http "+resp.status, await this.ownerId()); }catch{}
-      } finally { clearTimeout(_qt); }
-      if(blob&&blob.size){
-        const fd=new FormData();
-        fd.append("chat_id",String(chat));
-        fd.append("caption",cap);
-        fd.append("parse_mode","HTML");
-        fd.append("reply_markup",JSON.stringify(kb([
-          [btn(L(lang,"📊 آمار پنل‌ها","📊 Panel stats"),"stats:detail"), btn(L(lang,"🔄","🔄"),"stats:plans")],
-          [homeBtn(lang)],
-        ])));
-        fd.append("photo",blob,"plan.png");
-        const sr=await fetch(this.tg.base+"/sendPhoto",{method:"POST",body:fd});
-        const sj=await sr.json().catch(()=>null);
-        sent=!!(sj&&sj.ok);
-        try{ await this.addLog("plan_pie","post="+(sj&&sj.ok?"ok":String((sj&&sj.description)||"?")).slice(0,90), await this.ownerId()); }catch{}
-      }
-    }catch(e){
-      try{ await this.addLog("plan_pie","ex "+String(e&&e.message||e).slice(0,90), await this.ownerId()); }catch{}
-    }
-    if(!sent){
-      const max=Math.max.apply(null,counts);
-      const lines=counts.map((c,i)=>{
-        const f=Math.max(1,Math.round(c*10/max));
-        return (i+1)+") "+esc(labels[i])+"  "+"▰".repeat(f)+"▱".repeat(10-f)+"  *"+c+"* ("+pct(c)+"٪)";
-      });
-      await this.editOrSend(chat,mid,
-        uiHead("🥧",L(lang,"آمار قالب‌ها","Plan share"),L(lang,"سهم هر قالب","Share per plan"))+"\n\n"+lines.join("\n")+"\n\n👥 "+L(lang,"مجموع:","Total:")+" *"+total+"*",
-        kb([[btn(L(lang,"🔄 بروزرسانی","🔄 Refresh"),"stats:plans")],
-            [btn(L(lang,"📊 آمار پنل‌ها","📊 Panel stats"),"stats:detail")],
-            [homeBtn(lang)]]));
-    }
+    if(st && await this._planPieSend(chat, mid, st, lang, mode==="all"?"all":"live", "stats:plans")) return;
+    return this.cmdStats(chat,mid);
   }
 
   // List panels for inbound-level stats
