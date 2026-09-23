@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f24";
+const CODE_STAMP = "2026-09-19-f25";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -5192,7 +5192,11 @@ class Bot {
     }
     if(d==="pub:dash") return this.cmdPublicDashboard(chat,mid);
     if(d==="pub:flushq") return this.cmdFlushQueueManual(chat,mid);
+    // 🔴 f25: نمای اصلی آمار قالب‌ها = نمودار دایره‌ای (عکس)؛ متن کامل پشت «جزئیات»
     if(d==="pub:planstats") return this.cmdPublicPlanStats(chat,mid);
+    if(d==="pub:planstats:live") return this.cmdPublicPlanStats(chat,mid,"live");
+    if(d==="pub:planstats:all") return this.cmdPublicPlanStats(chat,mid,"all");
+    if(d==="pub:planstats:txt") return this.cmdPublicPlanStatsText(chat,mid);
     if(d==="pub:stats") return this.cmdPublicStats(chat,mid);
     if(d==="pub:online") return this._renderOnline(chat,mid,{onlyPublic:true,backCb:"m:public",updateCb:"pub:online"});
     if(d==="pub:clients") return this.cmdPublicClientsSelect(chat,mid);
@@ -12978,7 +12982,78 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
 
   /** صفحه کامل آمار قالب‌ها */
-  async cmdPublicPlanStats(chat, mid) {
+  /**
+   * 🥧 f25: آمار قالب‌های ربات عمومی — نمای اصلی حالا نمودار دایره‌ای است
+   * (مثل عکس نمونه: درصد سفید داخل برش، بدون لجند، پس‌زمینهٔ تیره).
+   * mode "live"=کانفیگ‌های فعال الان | "all"=کل استفاده از ابتدا.
+   * اگر ساخت عکس یا داده ناموفق بود → نمای متنی کامل (فال‌بک همیشگی).
+   */
+  async cmdPublicPlanStats(chat, mid, mode) {
+    const lang = await this.lang();
+    let st=null;
+    try{ st=await this._planUsageStats(); }catch{}
+    if(st && await this._planPieSend(chat, mid, st, lang, mode==="all"?"all":"live")) return;
+    return this.cmdPublicPlanStatsText(chat,mid);
+  }
+
+  /** ساخت + ارسال عکس 🥧 از دادهٔ آمار قالب. true=عکس رفت */
+  async _planPieSend(chat, mid, st, lang, mode) {
+    try{
+      const isLive = mode!=="all";
+      const sum = Number(isLive?st.liveTotal:st.totalTotal)||0;
+      if(sum<=0) return false;
+      const items=(st.rows||[]).map(r=>({name:String(r&&r.name||"?"), value:Number(isLive?r.live:r.total)||0}))
+        .filter(x=>x.value>0).sort((a,b)=>b.value-a.value);
+      if(!items.length) return false;
+      if(mid){ try{ await this.tg.call("deleteMessage",{chat_id:chat,message_id:mid}); }catch{} }
+      const fa=lang!=="en";
+      const head=isLive
+        ? ("📊 "+L(lang,"کانفیگ‌های فعال الان","Active configs now")+" — "+L(lang,"مجموع","Total")+" "+sum+(fa?" نفر":""))
+        : ("📈 "+L(lang,"کل استفاده از ابتدا","All-time usage")+" — "+L(lang,"مجموع","Total")+" "+sum+(fa?" بار":""));
+      const unit=fa?(isLive?" نفر":" بار"):"";
+      let rows=items.map(x=>"▪️ "+esc(x.name)+" — <b>"+x.value+"</b>"+unit+" ("+(x.value*100/sum).toFixed(1)+"٪)");
+      let cap=esc(uiHead("📦",L(lang,"آمار قالب‌ها","Plan statistics"),
+          L(lang,"کدام قالب بیشتر استفاده می‌شود","Which plan is used the most")))
+        +"\n\n"+head+"\n\n"+rows.join("\n");
+      while(cap.length>880&&rows.length>3){ rows.pop(); cap=esc(uiHead("📦",L(lang,"آمار قالب‌ها","Plan statistics"),
+          L(lang,"کدام قالب بیشتر استفاده می‌شود","Which plan is used the most")))+"\n\n"+head+"\n\n"+rows.join("\n")+"\n…"; }
+      cap+="\n\n↓ "+L(lang,"جزئیات کامل در پیام بعدی","full details in the next message");
+      const palette=["#5b9cf6","#3b6fe0","#6fc26f","#f2b544","#e05f5f","#9b6fe0","#42b8c5","#e08bb0","#8a9aa8","#c2d94c"];
+      const chartJS="({type:'pie',data:{labels:"+JSON.stringify(items.map((_,i)=>String(i+1)))+
+        ",datasets:[{data:"+JSON.stringify(items.map(x=>x.value))+",backgroundColor:"+JSON.stringify(items.map((_,i)=>palette[i%palette.length]))+
+        "}]},options:{legend:{display:false},plugins:{datalabels:{color:'#ffffff',font:{size:30,weight:'bold'},"+
+        "formatter:(v,ctx)=>(v*100/ctx.dataset.data.reduce((a,b)=>a+b,0)).toFixed(1)+'%'}}}})";
+      const _qc=new AbortController(); const _qt=setTimeout(()=>_qc.abort(),15000);
+      let blob=null;
+      try{
+        const resp=await fetch("https://quickchart.io/chart",{method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({width:640,height:640,backgroundColor:"#141a22",chart:chartJS}),
+          signal:_qc.signal});
+        if(resp.ok) blob=await resp.blob();
+      } finally { clearTimeout(_qt); }
+      if(!blob||!blob.size) return false;
+      const toggleCb = isLive?"pub:planstats:all":"pub:planstats:live";
+      const refreshCb = isLive?"pub:planstats:live":"pub:planstats:all";
+      const fd=new FormData();
+      fd.append("chat_id",String(chat));
+      fd.append("caption",cap);
+      fd.append("parse_mode","HTML");
+      fd.append("reply_markup",JSON.stringify(kb([
+        [btn(isLive?("📈 "+L(lang,"کل استفاده از ابتدا","All-time usage")):("📊 "+L(lang,"فعال الان","Active now")),toggleCb),
+         btn("🔄",refreshCb)],
+        [btn("📋 "+L(lang,"جزئیات کامل","Full details"),"pub:planstats:txt")],
+        [btn(L(lang,"◀ ربات عمومی","◀ Public Bot"),"m:public")],
+      ])));
+      fd.append("photo",blob,"plans.png");
+      const sr=await fetch(this.tg.base+"/sendPhoto",{method:"POST",body:fd});
+      const sj=await sr.json().catch(()=>null);
+      return !!(sj&&sj.ok);
+    }catch{ return false; }
+  }
+
+  /** 📄 نمای متنی کامل (فال‌بک / «جزئیات کامل») — همان گزارش دو‌بخشی قبلی */
+  async cmdPublicPlanStatsText(chat, mid) {
     const lang = await this.lang();
     const st = await this._planUsageStats();
     const lines = [
@@ -13010,7 +13085,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       "ℹ️ “Active now” drops when configs expire; “all-time” never decreases."));
 
     await this.editOrSend(chat, mid, lines.join("\n"), kb([
-      [btn(L(lang, "🔄 بروزرسانی", "🔄 Refresh"), "pub:planstats")],
+      [btn(L(lang, "🥧 نمودار", "🥧 Chart"), "pub:planstats"), btn(L(lang, "🔄 بروزرسانی", "🔄 Refresh"), "pub:planstats:txt")],
       [btn(L(lang, "📊 داشبورد", "📊 Dashboard"), "pub:dash")],
       [btn(L(lang, "◀ ربات عمومی", "◀ Public Bot"), "m:public")],
     ]));
