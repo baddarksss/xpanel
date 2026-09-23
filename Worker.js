@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f23";
+const CODE_STAMP = "2026-09-19-f24";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -5005,7 +5005,10 @@ class Bot {
     }
 
     if(d==="m:dash") return this.cmdDashboard(chat,mid);
-    if(d==="m:stats") return this.cmdStats(chat,mid);
+    // 🔴 f24 (بازخورد میدانی): «آمار» باید مستقیم نمودار دایره‌ای قالب‌ها را
+    //    باز کند (مثل عکس نمونه)؛ نمای متنیِ تفصیلی پشت «آمار پنل‌ها» رفت.
+    if(d==="m:stats") return this.cmdStatsPlanPie(chat,mid);
+    if(d==="stats:detail") return this.cmdStats(chat,mid);
     if(d==="stats:plans") return this.cmdStatsPlanPie(chat,mid);
     if(d==="stats:panels") return this.cmdStatsPanels(chat,mid);
     if(d.startsWith("stats:ib:")) return this.cmdStatsInbounds(chat,mid,d.substring(9));
@@ -13523,9 +13526,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     lines.push("📊  *"+fmtBytes(grandUp+grandDown)+"*  ·  🟢 "+grandOnline+"  ·  👥 "+grandClients);
 
     const rows=[
-      [btn(L(lang,"🥧 آمار قالب‌ها","🥧 Plan share"),"stats:plans")],
+      [btn(L(lang,"🥧 نمودار قالب‌ها","🥧 Plan chart"),"stats:plans")],
       [btn(L(lang,"📡 آمار اینباند","📡 Inbound stats"),"stats:panels")],
-      [btn(L(lang,"🔄 بروزرسانی","🔄 Refresh"),"m:stats"), homeBtn(lang)],
+      [btn(L(lang,"🔄 بروزرسانی","🔄 Refresh"),"stats:detail"), homeBtn(lang)],
     ];
     await this.editOrSend(chat,mid,lines.join("\n"),kb(rows));
   }
@@ -13568,25 +13571,57 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       return this.editOrSend(chat,mid,
         uiHead("🥧",L(lang,"آمار قالب‌ها","Plan share"),L(lang,"سهم هر قالب","Share per plan"))+"\n\n"+
         L(lang,"هنوز کانفیگی با قالب مشخص ثبت نشده.","No plan-tagged configs yet."),
-        kb([[btn(L(lang,"◀ بازگشت","◀ Back"),"m:stats")]]));
+        kb([[btn(L(lang,"📊 آمار پنل‌ها","📊 Panel stats"),"stats:detail")],[homeBtn(lang)]]));
     }
     const keys=Object.keys(byKey).filter(k=>byKey[k]>0);
     const labels=keys.map(k=>nameOf[k]||k).concat(unmapped>0?[L(lang,"نامشخص","Unknown")]:[]);
     const counts=keys.map(k=>byKey[k]).concat(unmapped>0?[unmapped]:[]);
     const pct=c=>Math.round(c*100/total);
-    const cap=uiHead("🥧",L(lang,"آمار قالب‌ها","Plan share"),L(lang,"سهم هر قالب از کانفیگ‌های صادرهٔ ربات","Each plan's share of bot-issued configs"))
-      +"\n\n"+counts.map((c,i)=>(i+1)+") "+esc(labels[i])+" — *"+c+"* ("+pct(c)+"٪)").join("\n")
-      +"\n\n👥 "+L(lang,"مجموع:","Total:")+" *"+total+"*";
+    // 🛡 f24: کپشن با HTML (esc کامل) — Markdown با نام قالب‌های دارای * یا _
+    //    ارسال عکس را می‌شکست و بی‌صدا به فال‌بک متنی می‌رفت.
+    const _pieHead=esc(uiHead("🥧",L(lang,"آمار قالب‌ها","Plan share"),L(lang,"سهم هر قالب از کانفیگ‌های صادرهٔ ربات","Each plan's share of bot-issued configs")));
+    const _pieTotal="👥 "+L(lang,"مجموع:","Total:")+" <b>"+total+"</b>";
+    let _pieRows=counts.map((c,i)=>(i+1)+") "+esc(labels[i])+" — <b>"+c+"</b> ("+pct(c)+"٪)");
+    let cap=_pieHead+"\n\n"+_pieRows.join("\n")+"\n\n"+_pieTotal;
+    while(cap.length>960&&_pieRows.length>3){ _pieRows.pop(); cap=_pieHead+"\n\n"+_pieRows.join("\n")+"\n…\n\n"+_pieTotal; }
     let sent=false;
     try{
+      // 🎯 f24: کانفیگ به‌صورت رشتهٔ JS با POST فرستاده می‌شود — فقط در این حالت
+      //    quickchart formatter تابعی را اجرا می‌کند (٪ داخل برش مثل عکس نمونه)
+      //    و لجندِ بالا هم نمی‌آید. GET/JSON تابع را نادیده می‌گیرد.
       const palette=["#5b9cf6","#3b6fe0","#6fc26f","#f2b544","#e05f5f","#9b6fe0","#42b8c5","#e08bb0","#8a9aa8","#c2d94c"];
-      const qc={type:"pie",
-        data:{labels:counts.map((_,i)=>String(i+1)),datasets:[{data:counts,backgroundColor:counts.map((_,i)=>palette[i%palette.length])}]},
-        options:{plugins:{legend:{display:false},datalabels:{color:"#ffffff",font:{size:26,weight:"bold"}}}}};
-      const url="https://quickchart.io/chart?w=640&h=640&bkg=%23141a22&c="+encodeURIComponent(JSON.stringify(qc));
-      const r=await this.tg.call("sendPhoto",{chat_id:chat,photo:url,caption:cap,parse_mode:"Markdown"});
-      sent=!!(r&&r.ok);
-    }catch{}
+      const chartJS="({type:'pie',data:{labels:"+JSON.stringify(counts.map((_,i)=>String(i+1)))+
+        ",datasets:[{data:"+JSON.stringify(counts)+",backgroundColor:"+JSON.stringify(counts.map((_,i)=>palette[i%palette.length]))+
+        "}]},options:{legend:{display:false},plugins:{datalabels:{color:'#ffffff',font:{size:30,weight:'bold'},"+
+        "formatter:(v,ctx)=>Math.round(v*100/ctx.dataset.data.reduce((a,b)=>a+b,0))+'%'}}}})";
+      const _qc=new AbortController(); const _qt=setTimeout(()=>_qc.abort(),15000);
+      let blob=null;
+      try{
+        const resp=await fetch("https://quickchart.io/chart",{method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({width:640,height:640,backgroundColor:"#141a22",chart:chartJS}),
+          signal:_qc.signal});
+        if(resp.ok) blob=await resp.blob();
+        else try{ await this.addLog("plan_pie","qc http "+resp.status, await this.ownerId()); }catch{}
+      } finally { clearTimeout(_qt); }
+      if(blob&&blob.size){
+        const fd=new FormData();
+        fd.append("chat_id",String(chat));
+        fd.append("caption",cap);
+        fd.append("parse_mode","HTML");
+        fd.append("reply_markup",JSON.stringify(kb([
+          [btn(L(lang,"📊 آمار پنل‌ها","📊 Panel stats"),"stats:detail"), btn(L(lang,"🔄","🔄"),"stats:plans")],
+          [homeBtn(lang)],
+        ])));
+        fd.append("photo",blob,"plan.png");
+        const sr=await fetch(this.tg.base+"/sendPhoto",{method:"POST",body:fd});
+        const sj=await sr.json().catch(()=>null);
+        sent=!!(sj&&sj.ok);
+        try{ await this.addLog("plan_pie","post="+(sj&&sj.ok?"ok":String((sj&&sj.description)||"?")).slice(0,90), await this.ownerId()); }catch{}
+      }
+    }catch(e){
+      try{ await this.addLog("plan_pie","ex "+String(e&&e.message||e).slice(0,90), await this.ownerId()); }catch{}
+    }
     if(!sent){
       const max=Math.max.apply(null,counts);
       const lines=counts.map((c,i)=>{
@@ -13595,7 +13630,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       });
       await this.editOrSend(chat,mid,
         uiHead("🥧",L(lang,"آمار قالب‌ها","Plan share"),L(lang,"سهم هر قالب","Share per plan"))+"\n\n"+lines.join("\n")+"\n\n👥 "+L(lang,"مجموع:","Total:")+" *"+total+"*",
-        kb([[btn(L(lang,"🔄 بروزرسانی","🔄 Refresh"),"stats:plans")],[btn(L(lang,"◀ بازگشت","◀ Back"),"m:stats")]]));
+        kb([[btn(L(lang,"🔄 بروزرسانی","🔄 Refresh"),"stats:plans")],
+            [btn(L(lang,"📊 آمار پنل‌ها","📊 Panel stats"),"stats:detail")],
+            [homeBtn(lang)]]));
     }
   }
 
