@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f32e";
+const CODE_STAMP = "2026-09-19-f32f";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -4150,6 +4150,19 @@ class PanelApi {
   // Get online clients
   async getOnlineWithStats() {
     return await this.getOnline().catch(()=>[]);
+  }
+
+  // 🕒 f32f: آخرین زمان ترافیک هر کلاینت (3x-ui جدید: POST /clients/lastOnline)
+  //    → obj = { email: epochMs } — خالی = پشتیبانی نمی‌شود
+  async getLastOnline() {
+    if(this.classic) return {};
+    try{
+      const r=await this.req("/clients/lastOnline","POST",{});
+      const obj=r&&r.obj;
+      if(obj && typeof obj==="object" && !Array.isArray(obj)) return obj;
+      if(Array.isArray(obj)){ const m={}; for(const it of obj){ if(it&&it.email) m[String(it.email)]=Number(it.lastOnline||0)||0; } return m; }
+      return {};
+    }catch{ return {}; }
   }
 
   // GET /panel/api/inbounds/list
@@ -13972,6 +13985,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       if(!ok){ failed.push(p.name); continue; }
       if(!online.length) continue;
 
+      let lastOnlineMap=null;
+      try{ lastOnlineMap=await api.getLastOnline(); }catch{ lastOnlineMap=null; }
       const emails=[];
       for(const u of online){
         const em=typeof u==="string"?u:(u&& (u.email||u.clientEmail)||"");
@@ -14037,8 +14052,20 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           }
           planTag=pn ? ("  *["+esc(pn)+"]*") : L(lang,"  _[نامشخص]_","  _[unknown]_");
         }
+        // 🕒 f32f: آخرین ترافیک کاربر (اگر پنل بدهد) — زنده‌بودن اتصال در خود لیست دیده می‌شود
+        let _agoTag="";
+        try{
+          const _lv=Number((lastOnlineMap&&(lastOnlineMap[em]||lastOnlineMap[emKey]))||0);
+          if(_lv>0){
+            const _sec=Math.max(0,Math.round((Date.now()-_lv)/1000));
+            const _ago=_sec<60 ? L(lang,"لحظه‌ای پیش","just now")
+              : _sec<3600 ? Math.floor(_sec/60)+L(lang," دقیقه پیش","m ago")
+              : Math.floor(_sec/3600)+L(lang," ساعت پیش","h ago");
+            _agoTag=L(lang,"  ·  ⏱ ","  ·  ⏱ ")+_ago;
+          }
+        }catch{}
         // label لینک‌دار است — بک‌تیک نگذار چون داخل code span لینک رندر نمی‌شود.
-        lines.push("🟢 "+label+planTag);
+        lines.push("🟢 "+label+_agoTag+planTag);
         shownCount++;
         if(lines.join("\n").length>MAX_CHARS){
           truncated=true;
@@ -21420,6 +21447,7 @@ export default {
         const targets=(panels||[]).filter(x=>x&&x.enabled&&(!pid||String(x.id)===String(pid))&&(!nmF||String(x.name||"").toLowerCase().indexOf(nmF)>=0)).slice(0,20);
         if(!targets.length) return deny("panel not found",404);
         const mask=(em)=> /^u\d+$/i.test(String(em)) ? String(em) : (String(em).slice(0,4)+"***"+String(em).slice(-3));
+        const emKey0=(em)=>String(em).toLowerCase().trim();
         const out=[];
         const maskIp=(ip)=>{const a=String(ip).split(".");return a.length===4?(a[0]+"."+a[1]+".*.*"):"*";};
         for(const panel of targets){
@@ -21475,11 +21503,18 @@ export default {
               ipProbe.perClient.push({email:mask(em), conns:(ips||[]).length, sample:(ips||[]).slice(0,3).map(maskIp)});
             }
           }
+          let lastOnlineMap={};
+          if(emails.length){ try{ lastOnlineMap=await api.getLastOnline(); }catch{} }
+          const nowMs=Date.now();
           out.push({panel:String(panel.id), name:panel.name||"", error:err||undefined,
             count:emails.length,
             rawType:Array.isArray(raw)?"array":(raw?"object":"none"),
             publicCount:emails.filter(e=>/^u\d+$/i.test(e)).length,
             emails:emails.slice(0,30).map(mask),
+            lastOnlineAgo:emails.slice(0,8).map(em=>{
+              const v=Number(lastOnlineMap[em]||lastOnlineMap[emKey0(em)]||0)||0;
+              return v>0?Math.max(0,Math.round((nowMs-v)/1000)):null;
+            }),
             ipProbe:ipProbe||undefined});
         }
         return new Response(JSON.stringify({ok:true, online:out, ts:Date.now()}),{status:200,headers:{"Content-Type":"application/json; charset=utf-8",...secHeaders}});
