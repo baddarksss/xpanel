@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f30";
+const CODE_STAMP = "2026-09-19-f31";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -1744,7 +1744,7 @@ function dynTools(lang, isOwner) {
   ];
   if(isOwner){
     rows.push([btn(labels.owner,"noop")]);
-    rows.push([btn(labels.adminpanels,"m:adminpanels")]);
+    // 🔀 f31: «دسترسی ادمین» به تنظیمات منتقل شد
     rows.push([btn(labels.deploy,"m:deploy"), btn(labels.cfusage,"m:cfusage")]);
     rows.push([btn(labels.bot_token,"tool:bot_token")]);
   }
@@ -5412,10 +5412,15 @@ class Bot {
       // شکل: cli:<pid>:<email>[:p<panelKey>]
       // پسوند اختیاریِ :p… مشخص می‌کند «بازگشت» به کدام لیست برگردد.
       const raw=d.substring(4);
-      const parts=raw.split(":");
+      let parts=raw.split(":");
       const pid=parts[0];
       let back=null;
-      if(parts.length>2 && /^p/.test(parts[parts.length-1])){
+      // 🔀 f31: پسوند pbk<backKey> — مقصدِ برگشت با ":" (مثل pub_adv:dis)
+      const _pbk=parts.findIndex((pp,ii)=>ii>1 && pp.startsWith("pbk") && pp.length>3);
+      if(_pbk>0){
+        back=parts.slice(_pbk).join(":").substring(3);
+        parts=parts.slice(0,_pbk);
+      } else if(parts.length>2 && /^p/.test(parts[parts.length-1])){
         back=parts.pop().substring(1);
       }
       const email=parts.slice(1).join(":");
@@ -10437,7 +10442,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     if(hits.length>40) lines.push("… +"+(hits.length-40));
     const rows=hits.slice(0,10).map(h=>{
       const dispName = formatUserEmail(h.email, users);
-      return [btn(dispName,"cli:"+h.pid+":"+h.email)];
+      // 🔀 f31: برگشت به «همین لیست نتایج» نه صفحهٔ دیگر
+      return [btn(dispName,"cli:"+h.pid+":"+h.email+":pbkpub_adv:"+filter)];
     });
     rows.push([btn(t(lang,"back"),"pub:search")]);
     await this.editOrSend(chat,mid,lines.join("\n"),kb(rows));
@@ -18027,6 +18033,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       rows.push([btn(btnLabels.renewmode,"set:renewmode")]);
       rows.push([btn(btnLabels.lang,"set:lang"), btn(btnLabels.add_admin,"set:admins")]);
       rows.push([btn(L(lang,"🔐 امنیت و کلیدها","🔐 Security & keys"),"set:security")]);
+      // 🔀 f31: «دسترسی ادمین» از ابزار به اینجا آمد
+      rows.push([btn(L(lang,"🔐 دسترسی ادمین","🔐 Admin access"),"m:adminpanels")]);
     }
     rows.push(navPair(lang, "m:main"));
     await this.editOrSend(chat,mid,lines.join("\n"), kb(rows));
@@ -20300,6 +20308,11 @@ export default {
           //     تشخیص داده و حذف می‌شد. مصرف باید از /clients/traffic خوانده شود.
           let tr=getTraffic(cl);
           let _trafficKnown = (tr.up||0)+(tr.down||0) > 0;
+          // 🔴 f31 (مورد میدانی «۱۲ ساعت شد، حذف نشد»): کلاینت از اسکن سبک
+          //    آمده و *فیلدهای* up/down را دارد ⇒ صفرِ آن «صفرِ واقعی» است،
+          //    نه ناآگاهی. قبلاً صفرِ لیست ناشناخته حساب می‌شد و شرط isIdle
+          //    هرگز برقرار نمی‌شد ⇒ کاربرِ بی‌استفاده هرگز حذف نمی‌شد.
+          if(!_trafficKnown && _fromList43 && (cl.up!=null||cl.down!=null)) _trafficKnown=true;
           // d43: fallback ترافیک فقط وقتی کلاینت در لیست نبود (مسیر get تکی که
           // up/down ندارد). دادهٔ لیست معتبر است — حتی صفر واقعی‌اش.
           if(!_trafficKnown && !_fromList43){
@@ -20329,6 +20342,8 @@ export default {
           // انتقال‌شده‌ها روی مقصد used=0 دارند؛ بدون این گارد همان لحظه idle حذف می‌شوند
           const isIdle=!u.xferAt && _trafficKnown && idleLimit>0 && createdTime>0 && idleHours>=idleLimit && used<_idleBytes;
 
+          // 🌐 f31: پیام‌های چرخهٔ عمر به زبانِ *خود کاربر* (bot_users.lang)
+          const _ul=((u&&u.lang)==="en")?"en":"fa";
           // سه‌حالته: فقط «not_member» قطعی باعث غیرفعال‌سازی می‌شود.
           // خطای موقت تلگرام نباید کانفیگ کاربر سالم را ببندد.
           let memberState="member";
@@ -20347,7 +20362,9 @@ export default {
                 await api.updateClient(u.email,{ enable:false });
                 // نوع واقعی چت (کانال/گروه) و نامش، مثل پیام عضویت.
                 // بدون واژهٔ «اجباری» — لحن باید دعوت‌کننده بماند.
-                if(tgInstance) await tgInstance.msg(id, "⚠️ کانفیگ شما موقتاً غیرفعال شد چون دیگر عضو "+_chatWord+_chatQuoted+" نیستید.\n\nبرای فعال‌سازی دوباره، در "+_chatWord+" عضو شوید و سپس دکمهٔ «🔗 کانفیگ‌های شما» را بزنید.");
+                if(tgInstance) await tgInstance.msg(id, L(_ul,
+                  "⚠️ کانفیگ شما موقتاً غیرفعال شد چون دیگر عضو "+_chatWord+_chatQuoted+" نیستید.\n\nبرای فعال‌سازی دوباره، در "+_chatWord+" عضو شوید و سپس دکمهٔ «🚀 دریافت کانفیگ رایگان» را بزنید.",
+                  "⚠️ Your config was temporarily disabled because you left "+_chatQuoted+".\n\nTo reactivate, join "+_chatQuoted+" again, then tap \"🚀 Get Free Config\"."));
               }catch{}
             }
           } else if(expired || isIdle){
@@ -20371,14 +20388,14 @@ export default {
             try{
               if(tgInstance){
                 if(expired){
-                  await tgInstance.msg(id,
-                    "⏰ اشتراک شما تمام شد و کانفیگ حذف شد. می‌توانید دوباره از ربات کانفیگ بگیرید."
-                  );
+                  await tgInstance.msg(id, L(_ul,
+                    "⏰ اشتراک شما تمام شد و کانفیگ حذف شد. می‌توانید دوباره از ربات کانفیگ بگیرید.",
+                    "⏰ Your subscription has ended and the config was deleted. You can get a new one from the bot anytime."));
                 } else {
                   const h=Math.max(1, Math.round(idleLimit));
-                  await tgInstance.msg(id,
-                    "🧹 کانفیگ شما به دلیل عدم استفاده در "+h+" ساعت گذشته حذف شد تا ظرفیت پنل برای بقیه آزاد شود.\nهر زمان خواستید می‌توانید دوباره رایگان از ربات کانفیگ بگیرید."
-                  );
+                  await tgInstance.msg(id, L(_ul,
+                    "🧹 کانفیگ شما به دلیل عدم استفاده در "+h+" ساعت گذشته حذف شد تا ظرفیت پنل برای بقیه آزاد شود.\nهر زمان خواستید می‌توانید دوباره رایگان از ربات کانفیگ بگیرید.",
+                    "🧹 Your config was deleted after "+h+" hours of inactivity to free up panel capacity.\nYou can get a new free config from the bot anytime."));
                 }
               }
             }catch{}
@@ -20386,9 +20403,9 @@ export default {
             if(cl.enable!==false){
               try{ await api.updateClient(u.email,{ enable:false }); }catch{}
               try{
-                if(tgInstance) await tgInstance.msg(id,
-                  "📉 حجم کانفیگ شما تمام شد و غیرفعال گردید. تا پایان زمان اشتراک (تاریخ انقضا) نمی‌توانید کانفیگ جدید بگیرید."
-                );
+                if(tgInstance) await tgInstance.msg(id, L(_ul,
+                  "📉 حجم کانفیگ شما تمام شد و غیرفعال گردید. تا پایان زمان اشتراک (تاریخ انقضا) نمی‌توانید کانفیگ جدید بگیرید.",
+                  "📉 Your config's volume is used up and it was disabled. You can get a new plan after the subscription period ends."));
               }catch{}
             }
           } else {
@@ -20399,7 +20416,9 @@ export default {
             if(cl.enable===false && (_trafficKnown||_fromList43)){
               try{
                 await api.updateClient(u.email,{ enable:true });
-                if(tgInstance) await tgInstance.msg(id, "🟢 کانفیگ شما به دلیل عضویت مجدد در "+_chatWord+" با موفقیت فعال شد!");
+                if(tgInstance) await tgInstance.msg(id, L(_ul,
+                  "🟢 کانفیگ شما به دلیل عضویت مجدد در "+_chatWord+" با موفقیت فعال شد!",
+                  "🟢 Your config was reactivated after rejoining!"));
               }catch{}
             }
           }
