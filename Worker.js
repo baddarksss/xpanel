@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f32";
+const CODE_STAMP = "2026-09-19-f32b";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -5781,6 +5781,10 @@ class Bot {
         const skmid=sk&&sk.result&&sk.result.message_id;
         if(skmid){ await new Promise(r=>setTimeout(r,400)); await this.tg.call("deleteMessage",{chat_id:chat,message_id:skmid}); }
       }catch{}
+      // 🔀 f32b: لینک عمیق «آیدی» از لیست آنلاین (t.me/BOT?start=card_<uid>)
+      //    → مستقیم کارت کاربر با مشخصات کامل کانفیگ، بدون باز شدن منو
+      const _cardM=/^card_(\d{3,})$/.exec(startPayload);
+      if(_cardM) return this.supportUserCard(chat, null, _cardM[1]);
       return this.showMain(chat, null, uid);
     }
 
@@ -13947,17 +13951,17 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       : uiHead("🟢", L(lang,"آنلاین","Online"), L(lang,"کاربران عادی متصل","Connected normal users"));
     // 🆕 UI پیشرفته‌تر: زمان + جمع در هدر
     const lines=[title, "🕐  "+homeClock()+L(lang,"   ·   جمع  ·  *","   ·   total  ·  *")+"0*"];
-    // 🔀 f32: راهنمای دکمه‌ها — نام=اکانت پنل، 🆔=اکانت ربات
-    lines.push(L(lang,"_🟢 نام → اکانت پنل  ·  🆔 → اکانت ربات_","_🟢 name → panel account  ·  🆔 → bot account_"));
+    // 🔀 f32b: بدون دکمه (بازخورد میدانی: لیست شلوغ پر از دکمه می‌شد) —
+    //    در خودِ متن: نام لینک → پروفایل شخصی، آیدی عددی لینک → کارت کاربر در ربات
+    lines.push(L(lang,"_🟢 نام → اکانت شخصی  ·  آیدی → کانفیگ در ربات_","_🟢 name → profile  ·  ID → bot account_"));
     const _hdrIdx=lines.length-1;
     let totalCount=0;      // مجموع واقعی آنلاین‌ها (حتی اگر در متن جا نشوند)
     let shownCount=0;      // تعدادی که واقعاً چاپ شد
     let truncated=false;
     const failed=[];
-    const onlineRows=[];   // 🔀 f32: دکمه‌های کاربران
-    const MAX_ROWS=60;
     const MAX_CHARS=3500;
     const globalSeen=new Set();   // ضد تکرار بین چند پنل (یک کاربر روی ۲ پنل)
+    let _botUname=null;           // 🔀 f32b: برای لینک عمیق آیدی (تنبل؛ کش ۲۴h)
     const planBackfill=[];        // رکوردهای قدیمی که planName نداشتند
 
     for(const p of panels){
@@ -14009,12 +14013,18 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         const em=emails[i];
         const emKey=String(em).toLowerCase().trim();
         const uid0=uidFromEmail(em);
-        // 🔀 f32: نام کوتاه برای دکمه (نام/یوزرنیم؛ وگرنه خود آیدی)
-        let disp=String(em);
+        // 🔀 f32b: برچسب متنی — نام لینک‌دار (پروفایل) + آیدی لینک‌دار (deep-link به کارت کاربر)
+        let label;
         if(uid0){
+          if(!_botUname) _botUname=await this._botUsername();
           const bu=users[String(uid0)];
-          const nm=bu?(((bu.firstName||"")+" "+(bu.lastName||"")).trim()||(bu.username?("@"+bu.username):"")):"";
-          disp=nm||String(uid0);
+          let nm=bu?(((bu.firstName||"")+" "+(bu.lastName||"")).trim()||(bu.username?("@"+bu.username):"")):"";
+          if(!nm) nm=String(uid0);
+          label=_botUname
+            ? (tgUserLink(uid0, nm)+" ("+"["+uid0+"](https://t.me/"+_botUname+"?start=card_"+uid0+")"+")")
+            : formatUserEmailLinked(em, users);
+        } else {
+          label=formatUserEmailLinked(em, users);
         }
         let planTag="";
         if(onlyPublic){
@@ -14025,16 +14035,15 @@ if(active && active.reachable && active.client && !active.expired && !active.not
             const inf=inferPlanFromClient(cl, plans);
             if(inf && uid0) planBackfill.push({uid:uid0, planId:String(inf.id), planName:String(inf.name||pn)});
           }
-          planTag=pn ? (" ["+pn+"]") : "";
+          planTag=pn ? ("  *["+esc(pn)+"]*") : L(lang,"  _[نامشخص]_","  _[unknown]_");
         }
-        // 🔀 f32: دکمهٔ نام → صفحهٔ اکانت روی پنل؛ دکمهٔ 🆔 → اکانت ربات
-        let _cb="cli:"+p.id+":"+em+(onlyPublic?":ol:pub":":ol:norm");
-        if(_cb.length>64) _cb="cli:"+p.id+":"+em;
-        const _row=[btn("🟢 "+disp+planTag, _cb)];
-        if(uid0) _row.push(btn("🆔 "+uid0, "sup:card:"+uid0));
-        onlineRows.push(_row);
+        // label لینک‌دار است — بک‌تیک نگذار چون داخل code span لینک رندر نمی‌شود.
+        lines.push("🟢 "+label+planTag);
         shownCount++;
-        if(shownCount>=MAX_ROWS){ truncated=true; break; }
+        if(lines.join("\n").length>MAX_CHARS){
+          truncated=true;
+          break;
+        }
       }
       lines.push("");
       if(truncated) break;
@@ -14042,7 +14051,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
 
     if(truncated){
       const left=Math.max(0, totalCount-shownCount);
-      if(left>0) lines.push(L(lang,"_… و ","_… and ")+left+L(lang," نفر دیگر (بزن 🔄 ببین‌شان)_"," more (tap 🔄 to cycle)_"));
+      if(left>0) lines.push(L(lang,"_… و ","_… and ")+left+L(lang," نفر دیگر (برای دیدن همه فیلتر کنید)_"," more (filter to see all)_"));
     }
     if(totalCount===0) lines.push(onlyPublic?L(lang,"کاربر عمومی آنلاینی نیست.","No public users online."):L(lang,"کاربر آنلاینی نیست.","No users online."));
     if(failed.length) lines.push(L(lang,"⚠️ پنل در دسترس نبود: ","⚠️ Unreachable panel: ")+failed.map(esc).join("، "));
@@ -14070,11 +14079,11 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       }catch(e){ console.error("plan backfill", e&&e.message); }
     }
 
-    // 🆕 سوییچ بین لیست عادی/عمومی + بروزرسانی + بازگشت — بعد از دکمه‌های کاربران
-    const _navRows=[[btn("🔄 "+t(lang,"update"),updateCb)]];
-    if(opts.switchTo) _navRows[0].push(btn(L(lang,"🔁 سوییچ: ","🔁 Switch: ")+(opts.switchLabel||""), opts.switchTo));
-    _navRows.push([btn(t(lang,"back"),backCb)]);
-    await this.editOrSend(chat,mid,lines.join("\n"),kb(onlineRows.concat(_navRows)));
+    // 🆕 سوییچ بین لیست عادی/عمومی + بروزرسانی + بازگشت
+    const _kbRows=[[btn("🔄 "+t(lang,"update"),updateCb)]];
+    if(opts.switchTo) _kbRows[0].push(btn(L(lang,"🔁 سوییچ: ","🔁 Switch: ")+(opts.switchLabel||""), opts.switchTo));
+    _kbRows.push([btn(t(lang,"back"),backCb)]);
+    await this.editOrSend(chat,mid,lines.join("\n"),kb(_kbRows));
   }
 
   // ---- Clients: Panel Selector ----
