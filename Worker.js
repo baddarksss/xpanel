@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f31";
+const CODE_STAMP = "2026-09-19-f31b";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -20306,16 +20306,40 @@ export default {
           //     (کامنت خودِ کد در showClientDetails همین را می‌گوید). بنابراین
           //     getTraffic(cl) همیشه صفر می‌داد و کانفیگِ کاربرِ فعال «بی‌استفاده»
           //     تشخیص داده و حذف می‌شد. مصرف باید از /clients/traffic خوانده شود.
+          // ⏱ f31b: سن‌سنجی اول (به ترافیک وابسته نیست) تا بتوانیم fetch هدفمند بزنیم
+          const exp=Number(cl.expiryTime||0)||0;
+          const plan=(u.planId!=null)?plans.find(x=>String(x.id)===String(u.planId)):null;
+          let createdTime=u.configCreated?new Date(u.configCreated).getTime():0;
+          if(!createdTime && exp && plan && Number(plan.days)>0){
+            createdTime=exp-Number(plan.days)*86400000;
+          }
+          const idleLimit=planIdleHours(plan||{days:1});
+          const idleHours=createdTime?(now-createdTime)/3600000:0;
+          const _idleBytes=planIdleBytes(plan||{});
           let tr=getTraffic(cl);
           let _trafficKnown = (tr.up||0)+(tr.down||0) > 0;
-          // 🔴 f31 (مورد میدانی «۱۲ ساعت شد، حذف نشد»): کلاینت از اسکن سبک
-          //    آمده و *فیلدهای* up/down را دارد ⇒ صفرِ آن «صفرِ واقعی» است،
-          //    نه ناآگاهی. قبلاً صفرِ لیست ناشناخته حساب می‌شد و شرط isIdle
-          //    هرگز برقرار نمی‌شد ⇒ کاربرِ بی‌استفاده هرگز حذف نمی‌شد.
-          if(!_trafficKnown && _fromList43 && (cl.up!=null||cl.down!=null)) _trafficKnown=true;
+          // 🔴 f31b (مورد میدانی «۶ ساعت گذشت، حذف نشد»): فیکس f31 فقط
+          //    up/down *سطح بالا* را می‌شناخت؛ ولی لیست این پنل‌ها ترافیک را
+          //    داخل cl.traffic (یا totalGB) می‌دهد ⇒ صفرِ واقعی باز هم
+          //    «ناشناخته» حساب می‌شد و حذفِ بی‌استفاده‌ها باز هم شلیک نمی‌کرد.
+          //    حالا همهٔ شکل‌های شناخته‌شدهٔ ترافیک «حضور داده» حساب می‌شوند.
+          if(!_trafficKnown && _fromList43 && (cl.up!=null||cl.down!=null||cl.traffic!=null||cl.totalGB!=null||cl.total!=null)) _trafficKnown=true;
           // d43: fallback ترافیک فقط وقتی کلاینت در لیست نبود (مسیر get تکی که
           // up/down ندارد). دادهٔ لیست معتبر است — حتی صفر واقعی‌اش.
           if(!_trafficKnown && !_fromList43){
+            try{
+              const _t=await api.getTraffic(u.email);
+              if(_t){
+                tr={ up:Number(_t.up)||0, down:Number(_t.down)||0, total:Number(_t.total)||tr.total||0 };
+                _trafficKnown = true;
+              }
+            }catch{}
+          }
+          // 🔴 f31b: آخرِ خط — اگر هنوز ناشناخته است ولی از نظر زمانی به آستانهٔ
+          //    idle رسیده، فقط برای همین کاندیدا یک getTraffic تکی بزن تا
+          //    «ناشناخته» هرگز به نفعِ بی‌استفاده تفسیر نشود. (هزینه: حداکثر
+          //    یک درخواست به‌ازای هر کاربرِ گذشته از آستانه — نه کل لیست)
+          if(!_trafficKnown && !u.xferAt && idleLimit>0 && createdTime>0 && idleHours>=idleLimit){
             try{
               const _t=await api.getTraffic(u.email);
               if(_t){
@@ -20328,17 +20352,8 @@ export default {
           //    نبودِ داده دلیل بی‌استفاده بودن نیست.
           const used=(tr.up||0)+(tr.down||0);
           const total=tr.total||0;
-          const exp=Number(cl.expiryTime||0)||0;
           const overQuota=total>0 && used>=total;
           const expired=(exp>0 && exp<=now) || (exp===0 && overQuota);
-          const plan=(u.planId!=null)?plans.find(x=>String(x.id)===String(u.planId)):null;
-          let createdTime=u.configCreated?new Date(u.configCreated).getTime():0;
-          if(!createdTime && exp && plan && Number(plan.days)>0){
-            createdTime=exp-Number(plan.days)*86400000;
-          }
-          const idleLimit=planIdleHours(plan||{days:1});
-          const idleHours=createdTime?(now-createdTime)/3600000:0;
-          const _idleBytes=planIdleBytes(plan||{});
           // انتقال‌شده‌ها روی مقصد used=0 دارند؛ بدون این گارد همان لحظه idle حذف می‌شوند
           const isIdle=!u.xferAt && _trafficKnown && idleLimit>0 && createdTime>0 && idleHours>=idleLimit && used<_idleBytes;
 
