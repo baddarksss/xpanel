@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f32b";
+const CODE_STAMP = "2026-09-19-f32e";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -21415,21 +21415,72 @@ export default {
         const bumped=await store.bumpDiagToken(rec);
         if(!bumped) return deny("Token exhausted and revoked. Generate a new one.",429);
         const pid=String(url.searchParams.get("panelId")||"").trim();
+        const nmF=String(url.searchParams.get("name")||"").trim().toLowerCase();
         const panels=await store.getPanels();
-        const targets=(panels||[]).filter(x=>x&&x.enabled&&(!pid||String(x.id)===String(pid))).slice(0,8);
+        const targets=(panels||[]).filter(x=>x&&x.enabled&&(!pid||String(x.id)===String(pid))&&(!nmF||String(x.name||"").toLowerCase().indexOf(nmF)>=0)).slice(0,20);
         if(!targets.length) return deny("panel not found",404);
         const mask=(em)=> /^u\d+$/i.test(String(em)) ? String(em) : (String(em).slice(0,4)+"***"+String(em).slice(-3));
         const out=[];
+        const maskIp=(ip)=>{const a=String(ip).split(".");return a.length===4?(a[0]+"."+a[1]+".*.*"):"*";};
         for(const panel of targets){
           const api=new PanelApi(panel.name,panel.url,panel.token,panel.id);
           let raw=null, err=null;
           try{ raw=await api.getOnline(); }catch(e){ err=String((e&&e.message)||e).slice(0,120); }
           const emails=(raw||[]).map(u=>typeof u==="string"?u:((u&&(u.email||u.clientEmail))||"")).filter(Boolean);
+          // 🔎 f32d: اتصالات همزمان هر کلاینت آنلاین.
+          //    3x-ui نسخهٔ refactor (آخر): GET /server/clientIps → همهٔ ردیف‌ها
+          //    یک‌جا ({clientEmail, ips:"[{ip,timestamp}]"} — IPهای ۳۰ دقیقهٔ اخیر).
+          //    نسخه‌های قدیمی‌تر: POST /inbounds/clientIps/{email} (فال‌بک).
+          let ipProbe=null;
+          if(emails.length){
+            ipProbe={mode:null, perClient:[]};
+            const byEmail=new Map();
+            try{
+              const r=await api.req("/server/clientIps","GET");
+              const rows=Array.isArray(r&&r.obj)?r.obj:[];
+              for(const row of rows){
+                if(!row||!row.clientEmail) continue;
+                let list=[];
+                try{ const a=JSON.parse(row.ips||"[]"); if(Array.isArray(a)) list=a; }catch{}
+                const ips=list.map(e=>typeof e==="string"?e:((e&&e.ip)||"")).filter(Boolean);
+                byEmail.set(String(row.clientEmail).toLowerCase(), ips);
+              }
+              ipProbe.mode="server/clientIps";
+              ipProbe.rows=rows.length;
+              ipProbe.rowsWithIps=rows.filter(r=>r&&r.clientEmail&&byEmail.get(String(r.clientEmail).toLowerCase())&&byEmail.get(String(r.clientEmail).toLowerCase()).length>0).length;
+            }catch(e){
+              ipProbe.mode="legacy";
+            }
+            for(const em of emails.slice(0,8)){
+              const key=String(em).toLowerCase();
+              let ips=null;
+              if(byEmail.has(key)){
+                ips=byEmail.get(key);
+              } else if(ipProbe.mode==="legacy"){
+                try{
+                  const path=api.classic
+                    ? "/panel/api/inbounds/clientIps/"+encodeURIComponent(em)
+                    : "/inbounds/clientIps/"+encodeURIComponent(em);
+                  const r2=await api.req(path,"POST",{});
+                  const obj=(r2&&Object.prototype.hasOwnProperty.call(r2,"obj"))?r2.obj:null;
+                  ips = Array.isArray(obj) ? obj.map(String)
+                      : (typeof obj==="string" && obj && obj!=="No IP Record") ? [obj] : [];
+                }catch(e2){
+                  ipProbe.perClient.push({email:mask(em), error:String((e2&&e2.message)||e2).slice(0,60)});
+                  continue;
+                }
+              } else {
+                ips=[];
+              }
+              ipProbe.perClient.push({email:mask(em), conns:(ips||[]).length, sample:(ips||[]).slice(0,3).map(maskIp)});
+            }
+          }
           out.push({panel:String(panel.id), name:panel.name||"", error:err||undefined,
             count:emails.length,
             rawType:Array.isArray(raw)?"array":(raw?"object":"none"),
             publicCount:emails.filter(e=>/^u\d+$/i.test(e)).length,
-            emails:emails.slice(0,30).map(mask)});
+            emails:emails.slice(0,30).map(mask),
+            ipProbe:ipProbe||undefined});
         }
         return new Response(JSON.stringify({ok:true, online:out, ts:Date.now()}),{status:200,headers:{"Content-Type":"application/json; charset=utf-8",...secHeaders}});
       }catch(e){ return deny(String((e&&e.message)||e).slice(0,200),500); }
