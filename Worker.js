@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f31b";
+const CODE_STAMP = "2026-09-19-f32";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -13947,11 +13947,15 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       : uiHead("🟢", L(lang,"آنلاین","Online"), L(lang,"کاربران عادی متصل","Connected normal users"));
     // 🆕 UI پیشرفته‌تر: زمان + جمع در هدر
     const lines=[title, "🕐  "+homeClock()+L(lang,"   ·   جمع  ·  *","   ·   total  ·  *")+"0*"];
+    // 🔀 f32: راهنمای دکمه‌ها — نام=اکانت پنل، 🆔=اکانت ربات
+    lines.push(L(lang,"_🟢 نام → اکانت پنل  ·  🆔 → اکانت ربات_","_🟢 name → panel account  ·  🆔 → bot account_"));
     const _hdrIdx=lines.length-1;
     let totalCount=0;      // مجموع واقعی آنلاین‌ها (حتی اگر در متن جا نشوند)
     let shownCount=0;      // تعدادی که واقعاً چاپ شد
     let truncated=false;
     const failed=[];
+    const onlineRows=[];   // 🔀 f32: دکمه‌های کاربران
+    const MAX_ROWS=60;
     const MAX_CHARS=3500;
     const globalSeen=new Set();   // ضد تکرار بین چند پنل (یک کاربر روی ۲ پنل)
     const planBackfill=[];        // رکوردهای قدیمی که planName نداشتند
@@ -14003,28 +14007,34 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       lines.push("🖥 *"+esc(p.name)+"*  ·  "+emails.length+L(lang," نفر آنلاین"," online"));
       for(let i=0;i<emails.length;i++){
         const em=emails[i];
-        const label=formatUserEmailLinked(em, users);
-        // نمای عمومی: فقط *نام قالب* داخل کروشه — نه مشخصات کامل قالب
+        const emKey=String(em).toLowerCase().trim();
+        const uid0=uidFromEmail(em);
+        // 🔀 f32: نام کوتاه برای دکمه (نام/یوزرنیم؛ وگرنه خود آیدی)
+        let disp=String(em);
+        if(uid0){
+          const bu=users[String(uid0)];
+          const nm=bu?(((bu.firstName||"")+" "+(bu.lastName||"")).trim()||(bu.username?("@"+bu.username):"")):"";
+          disp=nm||String(uid0);
+        }
         let planTag="";
         if(onlyPublic){
-          const cl=clientByEmail?clientByEmail.get(String(em).toLowerCase().trim()):null;
+          const cl=clientByEmail?clientByEmail.get(emKey):null;
           const pn=planLabelForEmail(em, users, plans, cl);
           // اگر از روی پنل تشخیص داده شد، رکورد کاربر را هم ترمیم کن تا دفعه بعد سریع باشد
           if(pn && cl && !planLabelForEmail(em, users, plans)){
             const inf=inferPlanFromClient(cl, plans);
-            const uid0=uidFromEmail(em);
             if(inf && uid0) planBackfill.push({uid:uid0, planId:String(inf.id), planName:String(inf.name||pn)});
           }
-          planTag=pn ? ("  *["+esc(pn)+"]*") : L(lang,"  _[نامشخص]_","  _[unknown]_");
+          planTag=pn ? (" ["+pn+"]") : "";
         }
-        // label از قبل لینک‌دار و esc‌شده است — بک‌تیک حذف شد چون
-        // داخل code span لینک رندر نمی‌شود.
-        lines.push("🟢 "+label+planTag);
+        // 🔀 f32: دکمهٔ نام → صفحهٔ اکانت روی پنل؛ دکمهٔ 🆔 → اکانت ربات
+        let _cb="cli:"+p.id+":"+em+(onlyPublic?":ol:pub":":ol:norm");
+        if(_cb.length>64) _cb="cli:"+p.id+":"+em;
+        const _row=[btn("🟢 "+disp+planTag, _cb)];
+        if(uid0) _row.push(btn("🆔 "+uid0, "sup:card:"+uid0));
+        onlineRows.push(_row);
         shownCount++;
-        if(lines.join("\n").length>MAX_CHARS){
-          truncated=true;
-          break;
-        }
+        if(shownCount>=MAX_ROWS){ truncated=true; break; }
       }
       lines.push("");
       if(truncated) break;
@@ -14032,7 +14042,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
 
     if(truncated){
       const left=Math.max(0, totalCount-shownCount);
-      if(left>0) lines.push(L(lang,"_… و ","_… and ")+left+L(lang," نفر دیگر (برای دیدن همه فیلتر کنید)_"," more (filter to see all)_"));
+      if(left>0) lines.push(L(lang,"_… و ","_… and ")+left+L(lang," نفر دیگر (بزن 🔄 ببین‌شان)_"," more (tap 🔄 to cycle)_"));
     }
     if(totalCount===0) lines.push(onlyPublic?L(lang,"کاربر عمومی آنلاینی نیست.","No public users online."):L(lang,"کاربر آنلاینی نیست.","No users online."));
     if(failed.length) lines.push(L(lang,"⚠️ پنل در دسترس نبود: ","⚠️ Unreachable panel: ")+failed.map(esc).join("، "));
@@ -14060,11 +14070,11 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       }catch(e){ console.error("plan backfill", e&&e.message); }
     }
 
-    // 🆕 سوییچ بین لیست عادی/عمومی + بروزرسانی + بازگشت
-    const _kbRows=[[btn("🔄 "+t(lang,"update"),updateCb)]];
-    if(opts.switchTo) _kbRows[0].push(btn(L(lang,"🔁 سوییچ: ","🔁 Switch: ")+(opts.switchLabel||""), opts.switchTo));
-    _kbRows.push([btn(t(lang,"back"),backCb)]);
-    await this.editOrSend(chat,mid,lines.join("\n"),kb(_kbRows));
+    // 🆕 سوییچ بین لیست عادی/عمومی + بروزرسانی + بازگشت — بعد از دکمه‌های کاربران
+    const _navRows=[[btn("🔄 "+t(lang,"update"),updateCb)]];
+    if(opts.switchTo) _navRows[0].push(btn(L(lang,"🔁 سوییچ: ","🔁 Switch: ")+(opts.switchLabel||""), opts.switchTo));
+    _navRows.push([btn(t(lang,"back"),backCb)]);
+    await this.editOrSend(chat,mid,lines.join("\n"),kb(onlineRows.concat(_navRows)));
   }
 
   // ---- Clients: Panel Selector ----
@@ -21379,6 +21389,40 @@ export default {
         try{ await store.setCache("pub:dead:"+String(pid),"",1); }catch{}
         try{ await store.pushLog({action:"diag_calibrate", detail:String(panel.name||pid)+" usedGB="+usedGB+" deletedGB="+(inferred/1073741824).toFixed(2)+" (was "+(oldDeleted/1073741824).toFixed(2)+")", by:"diag", meta:null}); }catch{}
         return new Response(JSON.stringify({ok:true, panel:String(panel.id), name:panel.name||"", liveGB:+(live/1073741824).toFixed(2), usedGB, deletedGB:+(inferred/1073741824).toFixed(2), oldDeletedGB:+(oldDeleted/1073741824).toFixed(2)}),{status:200,headers:{"Content-Type":"application/json; charset=utf-8",...secHeaders}});
+      }catch(e){ return deny(String((e&&e.message)||e).slice(0,200),500); }
+    }
+
+    // 🟢 f32: آنلاین‌های خام پنل‌ها (فقط‌خواندنی) — تطبیق عدد پنل با لیست ربات.
+    //    GET /diag/online[?panelId=<id>] → شکلِ خام پاسخ پنل + شمارش + نمونهٔ ماسک‌شده
+    if(url.pathname==="/diag/online"&&request.method==="GET"){
+      const secHeaders={"Cache-Control":"no-store, no-cache, must-revalidate, private","X-Robots-Tag":"noindex, nofollow, noarchive","X-Content-Type-Options":"nosniff"};
+      const deny=(msg,code)=>new Response(JSON.stringify({ok:false,error:msg}),{status:code,headers:{"Content-Type":"application/json",...secHeaders}});
+      try{
+        if(!(await store.isInstalled())) return deny("not installed",400);
+        const given=request.headers.get("X-Diag-Token")||"";
+        const rec=await store.getDiagToken();
+        await new Promise(r=>setTimeout(r,300));
+        if(!rec || !given || !timingSafeEq(given, rec.token)) return deny("Unauthorized or expired diag token",401);
+        const bumped=await store.bumpDiagToken(rec);
+        if(!bumped) return deny("Token exhausted and revoked. Generate a new one.",429);
+        const pid=String(url.searchParams.get("panelId")||"").trim();
+        const panels=await store.getPanels();
+        const targets=(panels||[]).filter(x=>x&&x.enabled&&(!pid||String(x.id)===String(pid))).slice(0,8);
+        if(!targets.length) return deny("panel not found",404);
+        const mask=(em)=> /^u\d+$/i.test(String(em)) ? String(em) : (String(em).slice(0,4)+"***"+String(em).slice(-3));
+        const out=[];
+        for(const panel of targets){
+          const api=new PanelApi(panel.name,panel.url,panel.token,panel.id);
+          let raw=null, err=null;
+          try{ raw=await api.getOnline(); }catch(e){ err=String((e&&e.message)||e).slice(0,120); }
+          const emails=(raw||[]).map(u=>typeof u==="string"?u:((u&&(u.email||u.clientEmail))||"")).filter(Boolean);
+          out.push({panel:String(panel.id), name:panel.name||"", error:err||undefined,
+            count:emails.length,
+            rawType:Array.isArray(raw)?"array":(raw?"object":"none"),
+            publicCount:emails.filter(e=>/^u\d+$/i.test(e)).length,
+            emails:emails.slice(0,30).map(mask)});
+        }
+        return new Response(JSON.stringify({ok:true, online:out, ts:Date.now()}),{status:200,headers:{"Content-Type":"application/json; charset=utf-8",...secHeaders}});
       }catch(e){ return deny(String((e&&e.message)||e).slice(0,200),500); }
     }
 
