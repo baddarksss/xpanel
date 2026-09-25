@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-25-f37";
+const CODE_STAMP = "2026-09-25-f38";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -1575,6 +1575,30 @@ function planIdleBytes(plan) {
   const n = Number(raw);
   if (Number.isFinite(n) && n > 0) return Math.round(n * 1024 * 1024);
   return IDLE_BYTES_DEFAULT;
+}
+/**
+ * 🧹 تصمیم «سوختن کانفیگ» در یک جا.
+ * کران (پاک‌سازی) و /diag/idle هر دو از همین استفاده می‌کنند تا هیچ‌وقت دو
+ * منطق متفاوت نداشته باشیم.
+ *   verdict: delete | disable | wait | keep | unknown
+ *   reason : idle | expired | over_quota | used | too_young | idle_off |
+ *            threshold_off | no_created | transferred
+ */
+function idleVerdict({used, total, expiryTime, plan, createdMs, now, xferAt}) {
+  const idleHours=planIdleHours(plan||{days:1});
+  const idleBytes=planIdleBytes(plan||{});
+  const ageHours = createdMs>0 ? (now-createdMs)/3600000 : null;
+  const base={idleHours, idleBytes, ageHours,
+    remainingHours:(ageHours!=null && idleHours>0)?Math.max(0, idleHours-ageHours):null};
+  if(xferAt) return {...base, verdict:"keep", reason:"transferred"};
+  if(expiryTime>0 && expiryTime<=now) return {...base, verdict:"delete", reason:"expired"};
+  if(total>0 && used>=total) return {...base, verdict:"disable", reason:"over_quota"};
+  if(idleHours<=0) return {...base, verdict:"keep", reason:"idle_off"};
+  if(idleBytes<=0) return {...base, verdict:"keep", reason:"threshold_off"};
+  if(!(createdMs>0)) return {...base, verdict:"unknown", reason:"no_created"};
+  if(ageHours<idleHours) return {...base, verdict:"wait", reason:"too_young"};
+  if(used>=idleBytes) return {...base, verdict:"keep", reason:"used"};
+  return {...base, verdict:"delete", reason:"idle"};
 }
 function panelKb(panels,prefix,lang="en",publicIds,backCb) {
   const pub=publicIds instanceof Set ? publicIds : new Set((publicIds||[]).map(String));
@@ -20771,17 +20795,33 @@ export default {
         const toClearCron=new Map();   // 🔴 f15: تصمیم‌های پاک‌سازی (merge-at-save)
         for(const id of Object.keys(users)){
           const u=users[id];
-          if(!u||!u.email||u.panelId==null) continue;
-          const p=panels.find(x=>String(x.id)===String(u.panelId));
+          if(!u) continue;
+          // 🔌 f38: کانفیگ «حالت تست» ادمین (utest<uid>) در فیلدهای جداگانه
+          //    (previewEmail/previewPanelId/previewPlanId/previewConfigCreated)
+          //    ذخیره می‌شود و تا قبل از این نسخه هیچ‌وقت در پاک‌سازی «بی‌استفاده»
+          //    دیده نمی‌شد ⇒ کانفیگ تستی تا ابد روی پنل می‌ماند (گزارش واقعی:
+          //    «۱۲ ساعت گذشت و نسوخت»). الان همان قاعدهٔ کانفیگ‌های عادی روی
+          //    کانفیگ تست هم اجرا می‌شود.
+          const _prevFields = !!(u.previewEmail && u.previewPanelId!=null);
+          const _legacyPrev  = isPreviewClientEmail(u.email, id);
+          const _isPrev      = _prevFields || _legacyPrev;
+          const _effEmail    = String((_prevFields ? u.previewEmail : u.email)||"").toLowerCase().trim();
+          const _effPanelId  = _prevFields ? u.previewPanelId : u.panelId;
+          const _effPlanId   = _prevFields ? u.previewPlanId  : u.planId;
+          const _effCreated  = _prevFields ? u.previewConfigCreated
+                                           : (u.configCreated||u.configAt||u.createdAt);
+          const _effXfer     = _isPrev ? "" : u.xferAt;
+          if(!_effEmail || _effPanelId==null) continue;
+          const p=panels.find(x=>String(x.id)===String(_effPanelId));
           if(!p) continue;
           // d43: اول از اسکن سبک ابتدای کران بخوان (۰ fetch)؛ فقط اگر ایمیل
           // در لیست نبود، get تکی بزن.
-          let cl=_cronMail.get(String(p.id)+":"+String(u.email).toLowerCase())||null;
+          let cl=_cronMail.get(String(p.id)+":"+_effEmail)||null;
           const _fromList43=!!cl;
           const api=new PanelApi(p.name,p.url,p.token,p.id);
           if(!cl){
             try{
-              const r=await api.getClient(u.email);
+              const r=await api.getClient(_effEmail);
               const obj=(r&&r.obj)||r||{};
               cl=obj.client||obj;
             }catch{ continue; }
@@ -20793,8 +20833,8 @@ export default {
           //     تشخیص داده و حذف می‌شد. مصرف باید از /clients/traffic خوانده شود.
           // ⏱ f31b: سن‌سنجی اول (به ترافیک وابسته نیست) تا بتوانیم fetch هدفمند بزنیم
           const exp=Number(cl.expiryTime||0)||0;
-          const plan=(u.planId!=null)?plans.find(x=>String(x.id)===String(u.planId)):null;
-          let createdTime=u.configCreated?new Date(u.configCreated).getTime():0;
+          const plan=(_effPlanId!=null)?plans.find(x=>String(x.id)===String(_effPlanId)):null;
+          let createdTime=_effCreated?new Date(_effCreated).getTime():0;
           if(!createdTime && exp && plan && Number(plan.days)>0){
             createdTime=exp-Number(plan.days)*86400000;
           }
@@ -20813,7 +20853,7 @@ export default {
           // up/down ندارد). دادهٔ لیست معتبر است — حتی صفر واقعی‌اش.
           if(!_trafficKnown && !_fromList43){
             try{
-              const _t=await api.getTraffic(u.email);
+              const _t=await api.getTraffic(_effEmail);
               if(_t){
                 tr={ up:Number(_t.up)||0, down:Number(_t.down)||0, total:Number(_t.total)||tr.total||0 };
                 _trafficKnown = true;
@@ -20824,9 +20864,9 @@ export default {
           //    idle رسیده، فقط برای همین کاندیدا یک getTraffic تکی بزن تا
           //    «ناشناخته» هرگز به نفعِ بی‌استفاده تفسیر نشود. (هزینه: حداکثر
           //    یک درخواست به‌ازای هر کاربرِ گذشته از آستانه — نه کل لیست)
-          if(!_trafficKnown && !u.xferAt && idleLimit>0 && createdTime>0 && idleHours>=idleLimit){
+          if(!_trafficKnown && !_effXfer && idleLimit>0 && createdTime>0 && idleHours>=idleLimit){
             try{
-              const _t=await api.getTraffic(u.email);
+              const _t=await api.getTraffic(_effEmail);
               if(_t){
                 tr={ up:Number(_t.up)||0, down:Number(_t.down)||0, total:Number(_t.total)||tr.total||0 };
                 _trafficKnown = true;
@@ -20840,7 +20880,7 @@ export default {
           const overQuota=total>0 && used>=total;
           const expired=(exp>0 && exp<=now) || (exp===0 && overQuota);
           // انتقال‌شده‌ها روی مقصد used=0 دارند؛ بدون این گارد همان لحظه idle حذف می‌شوند
-          const isIdle=!u.xferAt && _trafficKnown && idleLimit>0 && createdTime>0 && idleHours>=idleLimit && used<_idleBytes;
+          const isIdle=!_effXfer && _trafficKnown && idleLimit>0 && createdTime>0 && idleHours>=idleLimit && used<_idleBytes;
 
           // 🌐 f31: پیام‌های چرخهٔ عمر به زبانِ *خود کاربر* (bot_users.lang)
           const _ul=((u&&u.lang)==="en")?"en":"fa";
@@ -20870,20 +20910,26 @@ export default {
           } else if(expired || isIdle){
             try{
               if(used>0){ try{ await store.addDeletedPublicTraffic(p.id, used); }catch{} }
-              await api.deleteClient(u.email);
+              await api.deleteClient(_effEmail);
+              // 🔌 f38: ردِ سوختن در لاگ عیب‌یابی (برای دیدن در /diag → recentLogs)
+              try{
+                await store.pushLog({action:_isPrev?"idle_burn_preview":"idle_burn",
+                  detail:String(p.name||p.id)+" "+(expired?"expired":"idle")+" used="+(used/1048576).toFixed(1)+"MB age="+Math.round(idleHours)+"h idleH="+idleLimit+" idleMB="+Math.round(_idleBytes/1048576),
+                  by:"cron", meta:null});
+              }catch{}
             }catch{}
             // 🪦 قفل دوره را قبل از پاک‌کردن رکورد ثبت کن تا قانون «حجم+زمان با هم»
             //    حتی بعد از پاک‌شدن رکورد هم برقرار بماند. بدون این، پاک‌سازی اینجا
             //    همان باگ قدیمی را بازمی‌گرداند: کاربر با انقضای منطقی تموم‌شده ولی
             //    زمانِ باقی‌مانده، بلافاصله کانفیگ جدید می‌گرفت.
             try{
-              const _em5=String(u.email||"");
+              const _em5=String(_effEmail||"");
               const _expHint = exp>0 ? exp : 0;
               if(_em5 && isPublicClientEmail(_em5) && _expHint>Date.now()){
                 await store.put("pub:lastacct:"+String(id), JSON.stringify({email:_em5, exp:_expHint, at:Date.now(), reason: expired ? "expired" : "idle"}));
               }
             }catch{}
-            toClearCron.set(id, {em:String(u.email||""), reason: expired ? "expired" : "idle"});
+            toClearCron.set(id, {em:String(_effEmail||""), reason: expired ? "expired" : "idle", prev:_prevFields});
             changed=true;
             try{
               if(tgInstance){
@@ -20893,15 +20939,16 @@ export default {
                     "⏰ Your subscription has ended and the config was deleted. You can get a new one from the bot anytime."));
                 } else {
                   const h=Math.max(1, Math.round(idleLimit));
+                  const _ptag=_isPrev?"(حالت تست) ":"";
                   await tgInstance.msg(id, L(_ul,
-                    "🧹 کانفیگ شما به دلیل عدم استفاده در "+h+" ساعت گذشته حذف شد تا ظرفیت پنل برای بقیه آزاد شود.\nهر زمان خواستید می‌توانید دوباره رایگان از ربات کانفیگ بگیرید.",
+                    "🧹 "+_ptag+"کانفیگ شما به دلیل عدم استفاده در "+h+" ساعت گذشته حذف شد تا ظرفیت پنل برای بقیه آزاد شود.\nهر زمان خواستید می‌توانید دوباره رایگان از ربات کانفیگ بگیرید.",
                     "🧹 Your config was deleted after "+h+" hours of inactivity to free up panel capacity.\nYou can get a new free config from the bot anytime."));
                 }
               }
             }catch{}
           } else if(overQuota){
             if(cl.enable!==false){
-              try{ await api.updateClient(u.email,{ enable:false }); }catch{}
+              try{ await api.updateClient(_effEmail,{ enable:false }); }catch{}
               try{
                 if(tgInstance) await tgInstance.msg(id, L(_ul,
                   "📉 حجم کانفیگ شما تمام شد و غیرفعال گردید. تا پایان زمان اشتراک (تاریخ انقضا) نمی‌توانید کانفیگ جدید بگیرید.",
@@ -20915,7 +20962,7 @@ export default {
             // (با trafficOf تازه، هنگام زدن دکمه توسط خود کاربر) انجام می‌شود.
             if(cl.enable===false && (_trafficKnown||_fromList43)){
               try{
-                await api.updateClient(u.email,{ enable:true });
+                await api.updateClient(_effEmail,{ enable:true });
                 if(tgInstance) await tgInstance.msg(id, L(_ul,
                   "🟢 کانفیگ شما به دلیل عضویت مجدد در "+_chatWord+" با موفقیت فعال شد!",
                   "🟢 Your config was reactivated after rejoining!"));
@@ -20931,7 +20978,16 @@ export default {
             await store.withBotUsers((cur)=>{
               for(const [id2, dec2] of toClearCron){
                 const c=cur[id2];
-                if(!c || !c.email) continue;
+                if(!c) continue;
+                // 🔌 f38: کانفیگ تست ⇒ فقط فیلدهای preview پاک می‌شوند و حساب
+                //    واقعی ادمین (email/panelId/planId) دست‌نخورده می‌ماند.
+                if(dec2.prev){
+                  if(String(c.previewEmail||"").toLowerCase().trim()!==dec2.em) continue;
+                  delete c.previewEmail; delete c.previewPanelId; delete c.previewPlanId;
+                  delete c.previewPlanName; delete c.previewConfigCreated; delete c.previewConfig;
+                  continue;
+                }
+                if(!c.email) continue;
                 if(String(c.email)!==dec2.em) continue;
                 cur[id2]={...c, email:"", panelId:null, planId:null, planName:"", clearedAt:new Date().toISOString(), clearReason:dec2.reason};
               }
@@ -22037,6 +22093,84 @@ export default {
 
     // 🔑 ست/تعویض توکن پنل (یا یوزرنیم:پسورد برای پنل کلاسیک 3x-ui) با توکن عیب‌یابی
     //    POST /diag/paneltoken?t=...  body: {"panelId":"35","token":"user:pass","url":"https://host/managepanel"اختیاری}
+    // 🧹 f38: گزارش «چرا نسوخت؟» — تصمیم پاک‌سازی بی‌استفاده برای هر کانفیگ پنل
+    //    GET /diag/idle?panelId=46[&limit=50]  (فقط‌خواندنی؛ هیچ چیزی حذف نمی‌کند)
+    if(url.pathname==="/diag/idle"&&request.method==="GET"){
+      const secHeaders={"Cache-Control":"no-store, no-cache, must-revalidate, private","X-Robots-Tag":"noindex, nofollow, noarchive","X-Content-Type-Options":"nosniff"};
+      const deny=(msg,code)=>new Response(JSON.stringify({ok:false,error:msg}),{status:code,headers:{"Content-Type":"application/json",...secHeaders}});
+      try{
+        if(!(await store.isInstalled())) return deny("not installed",400);
+        const given=request.headers.get("X-Diag-Token")||"";
+        const rec=await store.getDiagToken();
+        await new Promise(r=>setTimeout(r,300));
+        if(!rec || !given || !timingSafeEq(given, rec.token)) return deny("Unauthorized or expired diag token",401);
+        const bumped=await store.bumpDiagToken(rec);
+        if(!bumped) return deny("Token exhausted and revoked. Generate a new one.",429);
+        const q=url.searchParams;
+        const pid=String(q.get("panelId")||"").trim();
+        if(!pid) return deny("panelId required",400);
+        const limit=Math.max(1, Math.min(200, Number(q.get("limit"))||60));
+        const panels=await store.getPanels();
+        const panel=(panels||[]).find(x=>String(x.id)===String(pid));
+        if(!panel) return deny("panel not found",404);
+        const api=new PanelApi(panel.name,panel.url,panel.token,panel.id);
+        let clients=[]; try{ clients=await api.getClients(); }catch(e){ return deny("getClients failed: "+String((e&&e.message)||e).slice(0,120),502); }
+        let plans=[]; try{ plans=await store.getPlans(); }catch{ plans=[]; }
+        let users={}; try{ users=await store.getBotUsers(); }catch{ users={}; }
+        // ایمیل ← متادیتای رکورد ربات (شامل کانفیگ تست در فیلدهای preview)
+        const metaByEm=new Map();
+        for(const id of Object.keys(users||{})){
+          const u=users[id]; if(!u) continue;
+          const mainEm=String(u.email||"").toLowerCase().trim();
+          if(mainEm) metaByEm.set(mainEm,{uid:String(id), planId:u.planId,
+            created:(u.configCreated||u.configAt||u.createdAt||""), xferAt:u.xferAt||"",
+            isPreview:isPreviewClientEmail(u.email,id)});
+          const pe=String(u.previewEmail||"").toLowerCase().trim();
+          if(pe && u.previewPanelId!=null) metaByEm.set(pe,{uid:String(id), planId:u.previewPlanId,
+            created:(u.previewConfigCreated||""), xferAt:"", isPreview:true});
+        }
+        const mask=(em)=> /^u\d+$/i.test(String(em)) ? String(em) : (String(em).slice(0,4)+"***"+String(em).slice(-3));
+        const now=Date.now();
+        const out=[];
+        for(const c of (clients||[])){
+          if(!c||!c.email) continue;
+          if(out.length>=limit) break;
+          const em=String(c.email).toLowerCase().trim();
+          const meta=metaByEm.get(em)||null;
+          const tr=getTraffic(c);
+          let used=(tr.up||0)+(tr.down||0);
+          let src="list";
+          if(c.up==null && c.down==null){
+            try{ const t2=await api.trafficOf(em,c); if(t2){ used=(t2.up||0)+(t2.down||0); src="resolved"; } }catch{}
+          }
+          const total=tr.total||0;
+          const exp=Number(c.expiryTime||0)||0;
+          let plan=null;
+          if(meta && meta.planId!=null) plan=(plans||[]).find(x=>String(x.id)===String(meta.planId))||null;
+          if(!plan && total>0) plan=(plans||[]).find(x=>{
+            const g=Number(x.trafficGB)||0;
+            return g>0 && Math.abs(g*1073741824-total)<=64*1024*1024;
+          })||null;
+          let createdMs = meta && meta.created ? new Date(meta.created).getTime() : 0;
+          if(!(createdMs>0) && plan && Number(plan.days)>0 && exp>0) createdMs=exp-Number(plan.days)*86400000;
+          const v=idleVerdict({used, total, expiryTime:exp, plan, createdMs, now, xferAt:meta?meta.xferAt:""});
+          out.push({
+            email:mask(em), isPreview:!!(meta&&meta.isPreview), bound:!!meta,
+            usedMB:+(used/1048576).toFixed(2), totalGB:+(total/1073741824).toFixed(2), src,
+            expiry: exp? new Date(exp).toISOString():null,
+            plan: plan?String(plan.name||plan.id):null, planDays: plan?(Number(plan.days)||0):null,
+            created: createdMs>0? new Date(createdMs).toISOString():null,
+            ageHours: v.ageHours==null?null:+v.ageHours.toFixed(1),
+            idleHours:v.idleHours, idleMB:+(v.idleBytes/1048576).toFixed(1),
+            remainingHours: v.remainingHours==null?null:+v.remainingHours.toFixed(1),
+            verdict:v.verdict, reason:v.reason,
+          });
+        }
+        return new Response(JSON.stringify({ok:true, now, panel:String(panel.id), name:panel.name||"", count:out.length, clients:out},null,2),
+          {status:200,headers:{"Content-Type":"application/json; charset=utf-8",...secHeaders}});
+      }catch(e){ return deny(String((e&&e.message)||e).slice(0,200),500); }
+    }
+
     if(url.pathname==="/diag/paneltoken"&&request.method==="POST"){
       const secHeaders={"Cache-Control":"no-store, no-cache, must-revalidate, private","X-Robots-Tag":"noindex, nofollow, noarchive","X-Content-Type-Options":"nosniff"};
       const deny=(msg,code)=>new Response(JSON.stringify({ok:false,error:msg}),{status:code,headers:{"Content-Type":"application/json",...secHeaders}});
