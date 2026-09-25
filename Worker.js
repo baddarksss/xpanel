@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-25-f41";
+const CODE_STAMP = "2026-09-25-f43";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -2780,6 +2780,13 @@ class Store {
     try{ await this.put(KEYS.IB_SECRET, s); }catch{ return null; }
     return s;
   }
+  // ♻️ f42: چرخش دستیِ کلید پوش اینباند (فقط مالک). ⚠️ بعد از چرخش، متغیر
+  //    IB_PUSH_URL در Railway باید با آدرس جدید به‌روز شود، وگرنه پنل‌ها ۴۰۳ می‌گیرند.
+  async rotateIbSecret() {
+    const s=randId(40);
+    try{ await this.put(KEYS.IB_SECRET, s); }catch{ return null; }
+    return s;
+  }
   // 🔌 f37: وضعیت رویدادها به‌ازای «هاستِ ورودی» (دامنه‌ای که کلاینت با آن وصل
   // شده). ربات لازم نیست هنگام رسیدن رویداد بداند مال کدام پنل است؛ فقط
   // می‌نویسد. هنگام نمایش، هاست‌های هر پنل از خود پنل خوانده و این وضعیت‌ها
@@ -4686,6 +4693,42 @@ class PanelApi {
 // توجه: این‌ها مکمل‌اند، نه جایگزین — اگر پنلی این نسخه را نداشته باشد، فقط نام
 // اینباند نمایش داده نمی‌شود و بقیهٔ لیست مثل قبل کار می‌کند.
 const IB_TTL_S = 1800;       // پنجرهٔ اعتبار رویداد (ثانیه) — هم‌اندازهٔ پنجرهٔ IP پنل
+
+// 📱 f43: «تعداد دستگاه» از روی IPهای پنل
+//   چرا: روی اینترنت همراه ایران (CGNAT) هر اتصال یک IP عمومی *تازه* از یک رنج
+//   می‌گیرد؛ نتیجه این بود که یک گوشی «📱۲۰ دستگاه» شمرده می‌شد در حالی که یک
+//   دستگاه بود. قاعدهٔ جدید:
+//     ۱) فقط IPهایی که در DEV_WINDOW_S ثانیهٔ اخیر دیده شده‌اند (یعنی «همین حالا»).
+//     ۲) IPv4 در حد /16 و IPv6 در حد /64 یک دستگاه حساب می‌شود (خوشهٔ اپراتور).
+//   ⇒ یک گوشی که IP عوض می‌کند = یک دستگاه.
+const DEV_WINDOW_S = 300;    // پنجرهٔ «همین حالا وصل است» (ثانیه) — قابل تنظیم
+function deviceKeyOf(ip){
+  const s0=String(ip||"").trim().toLowerCase().replace(/^::ffff:/,"");
+  if(!s0) return "";
+  if(s0.includes(":")){                     // IPv6 → /64
+    const p=s0.split(":").filter(Boolean);
+    return "v6:"+p.slice(0,4).join(":");
+  }
+  const p=s0.split(".");
+  if(p.length!==4) return "raw:"+s0;
+  return "v4:"+p.slice(0,2).join(".");      // IPv4 → /16
+}
+// list = [{ip,timestamp}] یا ["1.2.3.4", …]  |  nowS = زمان فعلی (ثانیه)، پیش‌فرض اکنون
+function countDevices(list, nowS){
+  if(!Array.isArray(list) || !list.length) return 0;
+  const now=(typeof nowS==="number" && nowS>0) ? nowS : Math.floor(Date.now()/1000);
+  const keys=new Set();
+  for(const e of list){
+    const ip=(typeof e==="string") ? e : ((e && (e.ip||e.IP)) || "");
+    if(!ip) continue;
+    let ts=(typeof e==="object" && e) ? Number(e.timestamp||e.ts||e.time||0)||0 : 0;
+    if(ts>1e12) ts=Math.floor(ts/1000);                 // میلی‌ثانیه → ثانیه
+    if(ts>0 && (now-ts)>DEV_WINDOW_S) continue;         // قدیمی ⇒ در شمارش نیاور
+    const k=deviceKeyOf(ip);
+    if(k) keys.add(k);
+  }
+  return keys.size;
+}
 const IB_MAP_TTL_S = 1800;   // عمر کش «مسیر ← اینباند» (تغییرات اینباند دیرتر از این دیده نمی‌شود)
 
 function ibNormPath(p) {
@@ -4938,7 +4981,24 @@ async function handleIbEvent(request, url, store) {
   try{
     const secret=await store.getIbSecret();
     const given=String(q.get("k")||"");
-    if(!secret || !given || !timingSafeEq(given, secret)) return new Response(null,{status:403});
+    if(!secret || !given || !timingSafeEq(given, secret)){
+      // 🔴 f42: قبلاً کلیدِ اشتباه/عوض‌شده کاملاً بی‌صدا رد می‌شد و فقط با «نام
+      //    اینباند نمی‌آید» فهمیده می‌شد. حالا شمارش می‌شود و حداکثر هر ۵ دقیقه
+      //    یک ردیف لاگ می‌گذارد تا در /diag دیده شود.
+      try{
+        let st=null;
+        try{ const r=await store.get("ib:bad"); st=r?(typeof r==="object"?r:JSON.parse(r)):null; }catch{}
+        st=st||{n:0};
+        const nowS=Math.floor(Date.now()/1000);
+        st.n=Number(st.n||0)+1; st.last=nowS;
+        if(!st.logts || (nowS-Number(st.logts))>=300){
+          st.logts=nowS;
+          try{ await store.pushLog({action:"ib_bad_key", detail:"کلید پوش اشتباه/غیرفعال — متغیر IB_PUSH_URL را با آدرس فعلی ربات به‌روز کن", by:"ib", meta:null}); }catch{}
+        }
+        await store.put("ib:bad", st);
+      }catch{}
+      return new Response(null,{status:403});
+    }
     const ev=String(q.get("ev")||"").toLowerCase();
     if(ev!=="open" && ev!=="close") return ok;
     const path=ibNormPath(q.get("u"));
@@ -5941,6 +6001,8 @@ class Bot {
     if(d==="set:wh_fix") return this.onWebhookFix(chat,mid,uid);
     if(d==="set:key_rot") return this.onRotateAdminKey(chat,mid,uid);
     if(d==="set:diag") return this.cmdDiagToken(chat,mid,uid);
+    if(d==="set:ib") return this.cmdIbPush(chat,mid,uid);
+    if(d==="set:ib_new") return this.onIbSecretNew(chat,mid,uid);
     if(d==="set:diag_new") return this.onDiagTokenNew(chat,mid,uid,false);
     if(d==="set:diag_new_deploy") return this.onDiagTokenNew(chat,mid,uid,true);
     if(d==="set:diag_new_unlim") return this.onDiagTokenNew(chat,mid,uid,true,true);
@@ -7620,6 +7682,15 @@ class Bot {
           if(_uW.d1 && (Number(_uW.d1.rowsRead)||0)>0.8*(Number(_uW.d1.freeCapRowsReadPerDay)||5000000)) issues.push({code:"d1_read_cap_warning", used24h:_uW.d1.rowsRead, capPerDay:_uW.d1.freeCapRowsReadPerDay});
         }
       }catch{}
+      // 🔌 f42: اگر پوش اینباند قبلاً کار می‌کرد و >۲۴ ساعت ساکت شده ⇒ کلید عوض
+      //    شده یا متغیر پاک شده. این هشدار جلوی «بی‌صدا خراب شدن» را می‌گیرد.
+      try{
+        const _ib=out.inboundEvents||{};
+        if(_ib.silent) issues.push({code:"ib_push_silent", lastEventAgeSec:_ib.lastEventAgeSec,
+          hint:"رویداد اینباند از پنل‌ها نمی‌رسد — آدرس فعلی را از منوی «🔌 رویداد اینباند (پوش پنل)» بگیر و در Railway به متغیر IB_PUSH_URL بده."});
+        if(Number(_ib.badKeys||0)>0) issues.push({code:"ib_bad_key", hits:_ib.badKeys,
+          hint:"پنل با کلید اشتباه پوش می‌کند — متغیر IB_PUSH_URL را با آدرس فعلی ربات به‌روز کن."});
+      }catch{}
       const mapped = (out.users && out.users.byPanel) || {};
       for(const row of (out.panels||[])){
         if(row.isPublic && !row.reachable){
@@ -7692,6 +7763,14 @@ class Bot {
         lastEventAgeSec: lastTs ? (nowS-lastTs) : null,
         ttlSec: IB_TTL_S,
       };
+      // 🩺 f42: کلید اشتباه + «سکوت» (رویداد داشته‌ایم ولی تازه نیست)
+      try{
+        let b=null;
+        try{ const r=await this.store.get("ib:bad"); b=r?(typeof r==="object"?r:JSON.parse(r)):null; }catch{}
+        out.inboundEvents.badKeys=b?Number(b.n||0):0;
+        out.inboundEvents.lastBadKeyAgeSec=(b&&b.last)?(nowS-Number(b.last)):null;
+        out.inboundEvents.silent=!!(evTotal>0 && lastTs && (nowS-lastTs)>86400);
+      }catch{}
     }catch(e){ out.inboundEvents={error:String(e&&e.message||e).slice(0,120)}; }
 
     return out;
@@ -14698,15 +14777,17 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           }
           planTag=pn ? (" · *["+esc(pn)+"]*") : L(lang," · _[نامشخص]_"," · _[unknown]_");
         }
-        // 📱 f33d: فقط اموجی گوشی + عدد
+        // 📱 f43: فقط اموجی گوشی + عددِ «دستگاه» (نه تعداد IP خام — بخش بالا توضیح)
         let devTag="";
         const _devIps=ipMap.get(emKey);
-        if(_devIps && _devIps.length) devTag=" · 📱"+_devIps.length;
+        const _devCount=countDevices(_devIps);
+        if(_devCount>0) devTag=" · 📱"+_devCount;
         // 🔌 f34: نام اینباندهایی که همین کاربر (با همین IPها) الان ازشان وصل است
         //    چند اینباند هم‌زمان ⇒ همه، به‌ترتیب جدیدترین. اگر معلوم نباشد ⇒ چیزی اضافه نمی‌شود.
         if(ibStates.length && _devIps && _devIps.length){
           const _ibs=ibActiveNames(ibStates, ibMap, _devIps);
-          if(_ibs.length) devTag+=" "+_ibs.map((_n)=>"["+esc(_n)+"]").join(" ");
+          // 📱 f43: نام هر اینباند جدا و با « · » — قبلاً به هم چسبیده بود
+          if(_ibs.length) devTag+=" · "+_ibs.map((_n)=>"["+esc(_n)+"]").join(" · ");
         }
         // label لینک‌دار است — بک‌تیک نگذار چون داخل code span لینک رندر نمی‌شود.
         lines.push("🟢 "+label+planTag+devTag);
@@ -18780,9 +18861,93 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     await this.editOrSend(chat,mid,lines.join("\n"), kb([
       [btn(L(lang,"🔄 ثبت مجدد وب‌هوک","🔄 Re-register webhook"),"set:wh_fix")],
       [btn(L(lang,"♻️ چرخش کلید مدیریتی","♻️ Rotate admin key"),"set:key_rot")],
+      [btn(L(lang,"🔌 رویداد اینباند (پوش پنل)","🔌 Inbound events (panel push)"),"set:ib")],
       [btn(L(lang,"🔍 توکن عیب‌یابی","🔍 Diagnostic token"),"set:diag")],
       navPair(lang, "m:settings"),
     ]));
+  }
+
+  /** 🔌 f42: آدرس پوش رویداد اینباند + راهنمای ست‌کردن در Railway — فقط مالک */
+  async cmdIbPush(chat,mid,uid) {
+    const lang=await this.lang();
+    if(!(await this.isOwner(uid))){
+      return this.editOrSend(chat,mid,L(lang,"⛔ فقط مالک","⛔ Owner only"),(await this.backMain()));
+    }
+    const sec=await this.store.getIbSecret();
+    let origin="";
+    try{ origin=String((await this.store.get(KEYS.WEBHOOK_URL))||"").replace(/\/+$/,""); }catch{}
+    const url=(sec&&origin)?(origin+"/ib?k="+sec):null;
+    const nowS=Math.floor(Date.now()/1000);
+    let ev=0,panelsWith=0,activePairs=0,lastTs=0;
+    try{
+      for(const p of ((await this.store.getPanels())||[])){
+        let hosts=[];
+        try{ const hv=await this.store.get("ib:hosts:"+String(p.id)); if(hv){ const o=(typeof hv==="object")?hv:JSON.parse(hv); hosts=(o&&o.h)||[]; } }catch{}
+        let any=false;
+        for(const h of hosts){
+          const st=await this.store.getIbHostState(h);
+          if(!st) continue;
+          any=true; ev+=Number(st.ev||0);
+          for(const ip in (st.ips||{})) for(const k in (st.ips[ip]||{})){
+            const e=st.ips[ip][k]||[];
+            if(Number(e[0]||0)>0 && (nowS-Number(e[1]||0))<=IB_TTL_S) activePairs++;
+          }
+          if(Number(st.last||0)>lastTs) lastTs=Number(st.last||0);
+        }
+        if(any) panelsWith++;
+      }
+    }catch{}
+    let bad=null;
+    try{ const r=await this.store.get("ib:bad"); bad=r?(typeof r==="object"?r:JSON.parse(r)):null; }catch{}
+    const age=lastTs?(nowS-lastTs):null;
+    const lines=[
+      uiHead("🔌", L(lang,"رویداد اینباند (پوش پنل)","Inbound events (panel push)"),
+             L(lang,"نمایش «کاربر روی کدام اینباند است»","Shows which inbound each client uses")),
+      "",
+      (ev>0?"🟢 ":"⚪️ ")+L(lang,"رویداد ثبت‌شده: *","Events recorded: *")+this._fmtNum(ev)+"*",
+      "🏷 "+L(lang,"پنل‌هایی که داده دارند: *","Panels with data: *")+panelsWith+"*",
+      "👥 "+L(lang,"جفت‌های فعال همین حالا: *","Active pairs now: *")+activePairs+"*",
+      (age==null
+        ? "⏱ "+L(lang,"آخرین رویداد: *هیچ* (هنوز از هیچ پنلی پوشی نرسیده)","⏱ Last event: *none* (no panel has pushed yet)")
+        : "⏱ "+L(lang,"آخرین رویداد: *","⏱ Last event: *")+fmtRemain(age*1000,lang)+" "+L(lang,"پیش*","ago*")),
+      (bad && Number(bad.n||0)>0
+        ? "⚠️ "+L(lang,"درخواست با کلید اشتباه: *","Requests with a wrong key: *")+this._fmtNum(Number(bad.n||0))+"*"
+        : "✅ "+L(lang,"هیچ درخواستِ کلید-اشتباهی نداشتیم","No requests with a wrong key")),
+      uiSep(),
+      L(lang,"مقداری که باید در Railway بگذاری:","Value to put in Railway:"),
+      "`IB_PUSH_URL`",
+      url?("`"+url+"`"):L(lang,"(آدرس ورکر پیدا نشد)","(worker origin not found)"),
+      "",
+      L(lang,"۱) Railway → سرویس پنل → Variables","1) Railway → your panel service → Variables"),
+      L(lang,"۲) متغیر بالا را با همین مقدار بساز","2) Add that variable with this value"),
+      L(lang,"۳) Deploy/Redeploy — از این به بعد نام اینباند کنار 📱N می‌آید","3) Deploy/Redeploy — inbound names then appear next to 📱N"),
+      "",
+      L(lang,"🔴 اگر متغیر را پاک کنی یا کلید را باطل کنی: پنل و کانفیگ‌ها سالم می‌مانند، فقط این بخش خاموش می‌شود. با همین منو هر وقت خواستی آدرس تازه را بگیر.","🔴 If you remove the variable or revoke the key: the panel and configs keep working; only this feature turns off. Come back to this menu anytime to get the current address."),
+      "",
+      "⚠️ "+L(lang,"اگر کلید را عوض کنی، آدرس بالا عوض می‌شود و باید در Railway هم به‌روزش کنی (وگرنه پنل‌ها با کلید قدیمی ۴۰۳ می‌گیرند).","If you rotate the key, the address changes — update the Railway variable too (otherwise panels get 403 with the old key)."),
+    ];
+    await this.editOrSend(chat,mid,lines.join("\n"), kb([
+      [btn(L(lang,"♻️ ساخت کلید جدید","♻️ New key"),"set:ib_new")],
+      navPair(lang, "set:security"),
+    ]));
+  }
+
+  /** ♻️ چرخش کلید پوش اینباند — فقط مالک (f42) */
+  async onIbSecretNew(chat,mid,uid) {
+    const lang=await this.lang();
+    if(!(await this.isOwner(uid))){
+      return this.editOrSend(chat,mid,L(lang,"⛔ فقط مالک","⛔ Owner only"),(await this.backMain()));
+    }
+    const s=await this.store.rotateIbSecret();
+    if(!s){
+      return this.editOrSend(chat,mid,L(lang,"⛔ خطای ذخیره‌ساز — کلید عوض نشد","⛔ Storage error — key was not rotated"),(await this.backMain()));
+    }
+    try{ await this.addLog("ib_secret_rotated", "owner="+uid+" new="+String(s).slice(0,4)+"…", uid); }catch{}
+    // نمایش آدرس تازه با همان صفحه
+    try{
+      await this.tg.msg(chat, L(lang,"♻️ کلید عوض شد. آدرس جدید:","♻️ Key rotated. New address:"), {reply_markup:{inline_keyboard:[]}});
+    }catch{}
+    return this.cmdIbPush(chat,mid,uid);
   }
 
   /** 🔍 توکن عیب‌یابی — فقط مالک */
@@ -22199,7 +22364,11 @@ export default {
               } else {
                 ips=[];
               }
-              ipProbe.perClient.push({email:mask(em), conns:(ips||[]).length, sample:(ips||[]).slice(0,3).map(maskIp),
+              // 📱 f43: «conns» تعداد IP خام است (ممکن است روی CGNAT زیاد باشد)؛
+              //    «devices» همان عددی است که در پیام نمایش داده می‌شود.
+              ipProbe.perClient.push({email:mask(em), conns:(ips||[]).length,
+                devices:countDevices(ips||[]), windowS:DEV_WINDOW_S,
+                sample:(ips||[]).slice(0,3).map(maskIp),
                 ib:ibActiveNames(ibStates, ibMap, ips||[])});
             }
           }
