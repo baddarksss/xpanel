@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-25-f43";
+const CODE_STAMP = "2026-09-25-f44";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -4387,6 +4387,7 @@ class PanelApi {
   //     تا سقف subrequest ورکر مصرف نشود.
   async getAllClientIps() {
     const map = new Map();
+    const tsMap = new Map();   // 📱 f44: email → Map(ip → ثانیهٔ آخرین دیده‌شدن)
     try {
       const r = await this.req("/server/clientIps", "GET");
       const rows = Array.isArray(r && r.obj) ? r.obj : [];
@@ -4395,10 +4396,25 @@ class PanelApi {
         let list = row.ips;
         if (typeof list === "string") { try { list = JSON.parse(list || "[]"); } catch { list = []; } }
         if (!Array.isArray(list)) list = [];
-        const ips = list.map(e => typeof e === "string" ? e : ((e && e.ip) || "")).filter(Boolean);
-        if (ips.length) map.set(String(row.clientEmail).toLowerCase().trim(), ips);
+        const ips = []; const tsm = new Map();
+        for (const e of list) {
+          const ip = typeof e === "string" ? e : ((e && e.ip) || "");
+          if (!ip) continue;
+          ips.push(ip);
+          let t = (typeof e === "object" && e) ? (Number(e.timestamp || e.ts || e.time || 0) || 0) : 0;
+          if (t > 1e12) t = Math.floor(t / 1000);        // میلی‌ثانیه → ثانیه
+          if (t > 0) tsm.set(ip, t);
+        }
+        if (ips.length) {
+          const k = String(row.clientEmail).toLowerCase().trim();
+          map.set(k, ips);
+          tsMap.set(k, tsm);
+        }
       }
     } catch {}
+    // 📱 f44: زمانِ آخرین دیده‌شدنِ هر IP — برای شمارش «در لحظه».
+    //    (خودِ map مثل قبل آرایهٔ رشته‌ای IP است تا بقیهٔ کد دست‌نخورده بماند)
+    try { Object.defineProperty(map, "_ts", { value: tsMap, enumerable: false }); } catch {}
     return map;
   }
 
@@ -4698,12 +4714,13 @@ const IB_TTL_S = 1800;       // پنجرهٔ اعتبار رویداد (ثانی
 //   چرا: روی اینترنت همراه ایران (CGNAT) هر اتصال یک IP عمومی *تازه* از یک رنج
 //   می‌گیرد؛ نتیجه این بود که یک گوشی «📱۲۰ دستگاه» شمرده می‌شد در حالی که یک
 //   دستگاه بود. قاعدهٔ جدید:
-//     ۱) IPهای داخل پنجرهٔ DEV_WINDOW_S (۳۰ دقیقه — همان پنجرهٔ IP خود پنل).
-//     ۲) IPv4 در حد /16 و IPv6 در حد /64 یک دستگاه حساب می‌شود (خوشهٔ اپراتور).
-//   ⇒ یک دستگاه که ۱۸ تا IP از یک رنج می‌گیرد = یک دستگاه (نه ۱۸ تا).
-//   نمونهٔ واقعی همین کاربر: ۲۰ IP ⇒ ۳ شبکه ⇒ 📱3 (دو اپراتور ایران + یک رنج
-//   آذربایجان) — نه 📱20.
-const DEV_WINDOW_S = 1800;   // پنجرهٔ شمارش — هم‌اندازهٔ پنجرهٔ IP خود پنل (۳۰ دقیقه)
+//     ۱) فقط IPهایی که در پنجرهٔ DEV_LIVE_S اتصال تازه داشته‌اند (پیش‌فرض ۵ دقیقه)
+//        ⇒ «در همین لحظه چند دستگاه وصل است».
+//     ۲) IPv4 در حد /16 و IPv6 در حد /64 یک دستگاه حساب می‌شود (خوشهٔ اپراتور)
+//        ⇒ دستگاهی که ۱۸ تا IP از یک رنج می‌گیرد، یک دستگاه است.
+//   ⇒ نه عدد ۲۰ برای یک گوشی، نه شمردن دستگاه‌هایی که نیم‌ساعت پیش قطع شده‌اند.
+const DEV_LIVE_S = 300;      // پنجرهٔ «در لحظه» (ثانیه) — دستگاهی که در این مدت
+                             // اتصال تازه داشته = همین حالا وصل است (تنظیم‌پذیر)
 function deviceKeyOf(ip){
   const s0=String(ip||"").trim().toLowerCase().replace(/^::ffff:/,"");
   if(!s0) return "";
@@ -4716,16 +4733,19 @@ function deviceKeyOf(ip){
   return "v4:"+p.slice(0,2).join(".");      // IPv4 → /16
 }
 // list = [{ip,timestamp}] یا ["1.2.3.4", …]  |  nowS = زمان فعلی (ثانیه)، پیش‌فرض اکنون
-function countDevices(list, nowS){
+// windowS = پنجرهٔ زمانی؛ پیش‌فرض DEV_LIVE_S. اگر timestamp نداشته باشد، IP «تازه»
+//           حساب می‌شود (پنل خودش فقط IPهای ۳۰ دقیقهٔ اخیر را می‌دهد).
+function countDevices(list, nowS, windowS){
   if(!Array.isArray(list) || !list.length) return 0;
   const now=(typeof nowS==="number" && nowS>0) ? nowS : Math.floor(Date.now()/1000);
+  const win=(typeof windowS==="number" && windowS>0) ? windowS : DEV_LIVE_S;
   const keys=new Set();
   for(const e of list){
     const ip=(typeof e==="string") ? e : ((e && (e.ip||e.IP)) || "");
     if(!ip) continue;
     let ts=(typeof e==="object" && e) ? Number(e.timestamp||e.ts||e.time||0)||0 : 0;
     if(ts>1e12) ts=Math.floor(ts/1000);                 // میلی‌ثانیه → ثانیه
-    if(ts>0 && (now-ts)>DEV_WINDOW_S) continue;         // قدیمی ⇒ در شمارش نیاور
+    if(ts>0 && (now-ts)>win) continue;                    // قدیمی ⇒ «در لحظه» نیست
     const k=deviceKeyOf(ip);
     if(k) keys.add(k);
   }
@@ -14779,17 +14799,20 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           }
           planTag=pn ? (" · *["+esc(pn)+"]*") : L(lang," · _[نامشخص]_"," · _[unknown]_");
         }
-        // 📱 f43: فقط اموجی گوشی + عددِ «دستگاه» (نه تعداد IP خام — بخش بالا توضیح)
+        // 📱 f44: فقط اموجی گوشی + عددِ دستگاه‌هایی که «همین حالا» وصل‌اند
         let devTag="";
         const _devIps=ipMap.get(emKey);
-        const _devCount=countDevices(_devIps);
+        const _tsmDev=(ipMap._ts && ipMap._ts.get(emKey)) || null;
+        const _devList=(_devIps||[]).map(_ip=>({ip:_ip, timestamp:(_tsmDev && _tsmDev.get(_ip))||0}));
+        const _devCount=countDevices(_devList, 0, DEV_LIVE_S);
         if(_devCount>0) devTag=" · 📱"+_devCount;
         // 🔌 f34: نام اینباندهایی که همین کاربر (با همین IPها) الان ازشان وصل است
         //    چند اینباند هم‌زمان ⇒ همه، به‌ترتیب جدیدترین. اگر معلوم نباشد ⇒ چیزی اضافه نمی‌شود.
         if(ibStates.length && _devIps && _devIps.length){
           const _ibs=ibActiveNames(ibStates, ibMap, _devIps);
-          // 📱 f43: نام هر اینباند جدا و با « · » — قبلاً به هم چسبیده بود
-          if(_ibs.length) devTag+=" · "+_ibs.map((_n)=>"["+esc(_n)+"]").join(" · ");
+          // 🔤 f44: براکت با «\[» اسکیپ می‌شود؛ در Markdown قدیمیِ تلگرام «[» خام
+          //    بلعیده می‌شد و نام‌ها بی‌براکت و چسبیده دیده می‌شدند.
+          if(_ibs.length) devTag+=" · "+_ibs.map((_n)=>"\\["+esc(_n)+"]").join(" · ");
         }
         // label لینک‌دار است — بک‌تیک نگذار چون داخل code span لینک رندر نمی‌شود.
         lines.push("🟢 "+label+planTag+devTag);
@@ -22319,6 +22342,7 @@ export default {
           if(emails.length){
             ipProbe={mode:null, perClient:[]};
             const byEmail=new Map();
+            const byEmailTs=new Map();   // 📱 f44
             try{
               const r=await api.req("/server/clientIps","GET");
               const rows=Array.isArray(r&&r.obj)?r.obj:[];
@@ -22326,8 +22350,17 @@ export default {
                 if(!row||!row.clientEmail) continue;
                 let list=[];
                 { let a=row.ips; if(typeof a==="string"){ try{ a=JSON.parse(a||"[]"); }catch{ a=[]; } } if(Array.isArray(a)) list=a; }
-                const ips=list.map(e=>typeof e==="string"?e:((e&&e.ip)||"")).filter(Boolean);
-                byEmail.set(String(row.clientEmail).toLowerCase(), ips);
+                const ips=[]; const tsm=new Map();
+                for(const e of list){
+                  const _ip=typeof e==="string"?e:((e&&e.ip)||"");
+                  if(!_ip) continue;
+                  ips.push(_ip);
+                  let _t=(typeof e==="object"&&e)?(Number(e.timestamp||e.ts||e.time||0)||0):0;
+                  if(_t>1e12) _t=Math.floor(_t/1000);
+                  if(_t>0) tsm.set(_ip,_t);
+                }
+                const _k=String(row.clientEmail).toLowerCase();
+                byEmail.set(_k, ips); byEmailTs.set(_k, tsm);
               }
               ipProbe.mode="server/clientIps";
               ipProbe.rows=rows.length;
@@ -22366,10 +22399,16 @@ export default {
               } else {
                 ips=[];
               }
-              // 📱 f43: «conns» تعداد IP خام است (ممکن است روی CGNAT زیاد باشد)؛
-              //    «devices» همان عددی است که در پیام نمایش داده می‌شود.
+              // 📱 f44: «conns» = تعداد IP خام؛ «devices» = همان عددی که در پیام
+              //    می‌آید (خوشه‌های تازه)، «newestAgo» = چند ثانیه از تازه‌ترین
+              //    اتصال گذشته (برای تنظیم پنجره).
+              const _tsm=byEmailTs.get(key)||new Map();
+              const _list=(ips||[]).map(_ip=>({ip:_ip, timestamp:_tsm.get(_ip)||0}));
+              const _now=Math.floor(Date.now()/1000);
+              const _newest=_list.reduce((m,x)=>Math.max(m, x.timestamp||0), 0);
               ipProbe.perClient.push({email:mask(em), conns:(ips||[]).length,
-                devices:countDevices(ips||[]), windowS:DEV_WINDOW_S,
+                devices:countDevices(_list,_now,DEV_LIVE_S), windowS:DEV_LIVE_S,
+                newestAgo:_newest>0?Math.max(0,_now-_newest):null,
                 sample:(ips||[]).slice(0,3).map(maskIp),
                 ib:ibActiveNames(ibStates, ibMap, ips||[])});
             }
