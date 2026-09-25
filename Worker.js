@@ -48,11 +48,11 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-19-f32f";
+const CODE_STAMP = "2026-09-25-f37";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
-const KEYS = { INSTALLED: "cfg:installed", BOT_TOKEN: "cfg:bot_token", OWNER_ID: "cfg:owner_id", ENCRYPTION_KEY: "cfg:enc_key", WEBHOOK_SECRET: "cfg:wh_secret", WEBHOOK_SECRET_APPLIED: "cfg:wh_secret_applied", ADMIN_KEY: "cfg:admin_key", WEBHOOK_URL: "cfg:webhook_url", WEBHOOK_INITIALIZED: "cfg:webhook_initialized", PANELS: "panels", SETTINGS: "settings", ADMINS: "admins", LANG: "lang", PLANS: "plans", LOGS: "op_logs", WATCHLIST: "watchlist", ADMIN_PANELS: "admin_panels", CF_DEPLOY: "cfg:cf_deploy", DEPLOY_PENDING: "cfg:deploy_pending", BOT_USERS: "bot_users", PUBLIC_CFG: "cfg:public", BACKUPS: "cfg:backups", PENDING_CFGS: "pub:pending_cfgs", PANEL_RESERVE: "pub:panel_reserve", DIAG_TOKEN: "cfg:diag_token", NOTIF_BOARD: "cfg:notif_board", SUPPORT_HISTORY: "support:history", CHANNEL_LAST: "pub:channel:last" };
+const KEYS = { INSTALLED: "cfg:installed", BOT_TOKEN: "cfg:bot_token", OWNER_ID: "cfg:owner_id", ENCRYPTION_KEY: "cfg:enc_key", WEBHOOK_SECRET: "cfg:wh_secret", WEBHOOK_SECRET_APPLIED: "cfg:wh_secret_applied", ADMIN_KEY: "cfg:admin_key", WEBHOOK_URL: "cfg:webhook_url", WEBHOOK_INITIALIZED: "cfg:webhook_initialized", PANELS: "panels", SETTINGS: "settings", ADMINS: "admins", LANG: "lang", PLANS: "plans", LOGS: "op_logs", WATCHLIST: "watchlist", ADMIN_PANELS: "admin_panels", CF_DEPLOY: "cfg:cf_deploy", DEPLOY_PENDING: "cfg:deploy_pending", BOT_USERS: "bot_users", PUBLIC_CFG: "cfg:public", BACKUPS: "cfg:backups", PENDING_CFGS: "pub:pending_cfgs", PANEL_RESERVE: "pub:panel_reserve", DIAG_TOKEN: "cfg:diag_token", NOTIF_BOARD: "cfg:notif_board", SUPPORT_HISTORY: "support:history", CHANNEL_LAST: "pub:channel:last", IB_SECRET: "cfg:ib_secret" };
 const STATS_GROUP_NAME = "xpanel-stats";
 const CACHE_TTL = { STATS: 30, CLIENTS: 30, ONLINE: 10, INBOUNDS: 60 };
 /**
@@ -2595,6 +2595,33 @@ class Store {
   }
   async getPanels() { const r=await this.get(KEYS.PANELS); if(!r) return []; try{ const v=typeof r==="object"?r:JSON.parse(r); return Array.isArray(v)?v:[]; }catch{ return []; } }
   async savePanels(p) { await this.put(KEYS.PANELS,p); }
+
+  // 🔌 f34: کلید مشترک اندپوینت رویدادهای اینباند (nginx پنل با آن احراز می‌شود)
+  async getIbSecret() {
+    let v=null;
+    try{ v=await this.get(KEYS.IB_SECRET); }catch{}
+    if(v && String(v).length>=16) return String(v);
+    const s=randId(40);
+    try{ await this.put(KEYS.IB_SECRET, s); }catch{ return null; }
+    return s;
+  }
+  // 🔌 f37: وضعیت رویدادها به‌ازای «هاستِ ورودی» (دامنه‌ای که کلاینت با آن وصل
+  // شده). ربات لازم نیست هنگام رسیدن رویداد بداند مال کدام پنل است؛ فقط
+  // می‌نویسد. هنگام نمایش، هاست‌های هر پنل از خود پنل خوانده و این وضعیت‌ها
+  // کنار هم گذاشته می‌شوند. مزیت: اندپوینت /ib هیچ تماس شبکه‌ای به پنل‌ها ندارد
+  // ⇒ سریع (چند صد میلی‌ثانیه) و بدون خطر تایم‌اوت شدن پوش nginx.
+  // شکل: {ips:{ip:{path:[count,ts]}}, ev, last}
+  async getIbHostState(host) {
+    try{
+      const v=await this.get("ib:st:h:"+String(host));
+      if(!v) return null;
+      const o=(typeof v==="object")?v:JSON.parse(v);
+      return (o && typeof o==="object") ? o : null;
+    }catch{ return null; }
+  }
+  async putIbHostState(host, st) {
+    try{ await this.put("ib:st:h:"+String(host), JSON.stringify(st), 7*24*3600); }catch{}
+  }
   async getSettings() {
     const r=await this.get(KEYS.SETTINGS);
     if(!r) return {...DEFAULT_SETTINGS, _cfgRev:0};
@@ -3554,6 +3581,31 @@ async function ensureWebhookRegistered(store, token, webhookUrl, force) {
 // Base path: /panel/api
 // Auth: Bearer token
 // Client ID: email
+// 🔌 f34: احراز هویت توکن دیاگ برای روت‌های جدید (همان قواعد /diag)
+async function diagAuth(request, store) {
+  const secHeaders={
+    "Cache-Control":"no-store, no-cache, must-revalidate, private",
+    "X-Robots-Tag":"noindex, nofollow, noarchive",
+    "X-Content-Type-Options":"nosniff",
+    "Referrer-Policy":"no-referrer",
+    "X-Frame-Options":"DENY",
+  };
+  const deny=(msg,code)=>new Response(JSON.stringify({ok:false,error:msg}),
+    {status:code,headers:{"Content-Type":"application/json",...secHeaders}});
+  try{
+    if(!(await store.isInstalled())) return {err:deny("not installed",400)};
+    const given=request.headers.get("X-Diag-Token")||"";
+    const rec=await store.getDiagToken();
+    await new Promise(r=>setTimeout(r,300));
+    if(!rec || !given || !timingSafeEq(given, rec.token)) return {err:deny("Unauthorized or expired diag token",401)};
+    const bumped=await store.bumpDiagToken(rec);
+    if(!bumped) return {err:deny("Token exhausted and revoked. Generate a new one.",429)};
+    return {ok:true, secHeaders, rec, bumped};
+  }catch(e){
+    return {err:deny(String(e&&e.message||e).slice(0,200),500)};
+  }
+}
+
 class PanelApi {
   constructor(name,url,token,id) {
     this.name=name; this.url=url.replace(/\/+$/,""); this.token=token; this.id=id;
@@ -4147,6 +4199,38 @@ class PanelApi {
     } catch { return []; }
   }
 
+  // 📱 f33: تعداد دستگاه‌های متصل هر کلاینت (IPهای پنجرهٔ ~۳۰ دقیقهٔ اخیر پنل).
+  //     پنل جدید آرایه می‌دهد [{ip,timestamp}] و نسخه‌های قدیمی‌تر رشتهٔ JSON —
+  //     هر دو پشتیبانی می‌شوند. یک درخواست برای کل پنل (نه یکی برای هر کاربر)
+  //     تا سقف subrequest ورکر مصرف نشود.
+  async getAllClientIps() {
+    const map = new Map();
+    try {
+      const r = await this.req("/server/clientIps", "GET");
+      const rows = Array.isArray(r && r.obj) ? r.obj : [];
+      for (const row of rows) {
+        if (!row || !row.clientEmail) continue;
+        let list = row.ips;
+        if (typeof list === "string") { try { list = JSON.parse(list || "[]"); } catch { list = []; } }
+        if (!Array.isArray(list)) list = [];
+        const ips = list.map(e => typeof e === "string" ? e : ((e && e.ip) || "")).filter(Boolean);
+        if (ips.length) map.set(String(row.clientEmail).toLowerCase().trim(), ips);
+      }
+    } catch {}
+    return map;
+  }
+
+  // نسخهٔ تک‌کاربره (فال‌بک/کارت کاربر) — POST /clients/ips/{email}
+  async getClientIps(email) {
+    try {
+      const r = await this.req("/clients/ips/" + encodeURIComponent(email), "POST", {});
+      const o = r && r.obj;
+      if (Array.isArray(o)) return o.map(x => typeof x === "string" ? x : ((x && x.ip) || "")).filter(Boolean);
+      if (typeof o === "string" && o.trim() && o.trim() !== "No IP Record") return o.split(/[\s,]+/).filter(Boolean);
+      return [];
+    } catch { return []; }
+  }
+
   // Get online clients
   async getOnlineWithStats() {
     return await this.getOnline().catch(()=>[]);
@@ -4420,6 +4504,293 @@ class PanelApi {
 }
 
 // ---- Bot ----
+// ================= 🔌 f34: رویدادهای اینباند (کاربر روی کدام اینباند است) =================
+// nginx پنل در لحظهٔ باز شدن هر تونل یک درخواست کوتاه به /ib می‌فرستد (mirror) و
+// در لحظهٔ بسته شدنش هم یکی (post_action). اینجا آن رویداد به «IP کاربر ← اینباند»
+// تبدیل و ذخیره می‌شود؛ لیست آنلاین ربات از همین نگاشت استفاده می‌کند.
+// توجه: این‌ها مکمل‌اند، نه جایگزین — اگر پنلی این نسخه را نداشته باشد، فقط نام
+// اینباند نمایش داده نمی‌شود و بقیهٔ لیست مثل قبل کار می‌کند.
+const IB_TTL_S = 1800;       // پنجرهٔ اعتبار رویداد (ثانیه) — هم‌اندازهٔ پنجرهٔ IP پنل
+const IB_MAP_TTL_S = 1800;   // عمر کش «مسیر ← اینباند» (تغییرات اینباند دیرتر از این دیده نمی‌شود)
+
+function ibNormPath(p) {
+  let s=String(p==null?"":p).trim();
+  if(!s || s.charAt(0)!=="/") return "";
+  if(s.length>1) s=s.replace(/\/+$/,"");
+  return s.slice(0,200);
+}
+function ibMatch(map, path) {
+  if(!map) return null;
+  const p=ibNormPath(path);
+  if(!p) return null;
+  if(map[p]) return map[p];
+  let best=null, bestLen=-1;
+  for(const k in map){
+    if(!k || k==="/") continue;
+    if(p===k || p.indexOf(k+"/")===0){ if(k.length>bestLen){ bestLen=k.length; best=map[k]; } }
+  }
+  return best;
+}
+function ibPrune(st, nowS) {
+  const ips=(st && st.ips)||{};
+  let kept=0;
+  for(const ip in ips){
+    const per=ips[ip]||{};
+    for(const k in per){
+      const e=per[k]||[];
+      const c=Number(e[0]||0), t=Number(e[1]||0);
+      if((nowS-t)>IB_TTL_S || (c<=0 && (nowS-t)>600)) delete per[k];
+    }
+    if(Object.keys(per).length) kept++; else delete ips[ip];
+  }
+  if(kept>600){
+    const arr=[];
+    for(const ip in ips){
+      let mx=0; for(const k in ips[ip]){ const t=Number((ips[ip][k]||[])[1]||0); if(t>mx) mx=t; }
+      arr.push({ip,t:mx});
+    }
+    arr.sort((a,b)=>a.t-b.t);
+    for(let i=0;i<arr.length-600;i++) delete ips[arr[i].ip];
+  }
+  if(st) st.ips=ips;
+  return st;
+}
+// نام اینباندهای فعال برای مجموعه‌ای از IPها (جدیدترین اول، بدون تکرار)
+// 🔌 f37: نام اینباندهای فعال برای مجموعه‌ای از IPها.
+// states = وضعیت یک یا چند هاستِ همین پنل، map = نگاشت «مسیر ← نام اینباند».
+// (کلید وضعیت، مسیر درخواست است؛ نام تازه هنگام نمایش حل می‌شود.)
+function ibActiveNames(states, map, ips, nowS) {
+  const out=[];
+  if(!states || !states.length || !ips || !ips.length) return out;
+  const now=(nowS||Math.floor(Date.now()/1000));
+  const seen=new Map();
+  for(const st0 of states){
+    if(!st0 || !st0.ips) continue;
+    for(const ip of ips){
+      const per=st0.ips[ip];
+      if(!per) continue;
+      for(const k in per){
+        const e=per[k]||[];
+        const c=Number(e[0]||0), t=Number(e[1]||0);
+        if(c<=0 || (now-t)>IB_TTL_S) continue;
+        const hit=map ? ibMatch(map, k) : null;
+        const n=hit ? String(hit.n||"") : "";
+        if(!n) continue;
+        const cur=seen.get(n);
+        if(cur==null || t>cur) seen.set(n,t);
+      }
+    }
+  }
+  const arr=[];
+  seen.forEach((t,n)=>arr.push([n,t]));
+  arr.sort((a,b)=>b[1]-a[1]);
+  for(const x of arr) out.push(x[0]);
+  return out;
+}
+// نگاشت «مسیر درخواست ← اینباند» از روی لیست اینباندهای پنل
+// 🔌 f35: هاست‌های شناخته‌شدهٔ هر پنل.
+// کلاینت‌ها بسته به تنظیمات هر اینباند، یا با دامنهٔ خود پنل وصل می‌شوند یا با
+// هاستی که داخل تنظیمات همان اینباند نوشته شده (مثلاً دامنهٔ پیش‌فرض Railway).
+// پس برای تشخیص «این رویداد مال کدام پنل است» فهرست همهٔ این هاست‌ها را
+// از API خود پنل‌ها می‌سازیم و کش می‌کنیم.
+const IB_HOSTS_TTL_S = 6*3600;
+// سقف زمانی تشخیص هم‌زمانِ پنل از روی API (کش سرد). nginx پوش را تا ۶ ثانیه
+// صبر می‌کند، پس این مقدار امن است و رویداد اول هم از دست نمی‌رود.
+const IB_SYNC_RESOLVE_MS = 1500;
+function ibHostNorm(v) {
+  let x=String(v==null?"":v).trim().toLowerCase();
+  if(!x) return "";
+  x=x.replace(/^https?:\/\//,"");
+  x=x.split("/")[0];
+  x=x.replace(/:[0-9]+$/,"");
+  if(x.indexOf(".")<0) return "";
+  return x.slice(0,190);
+}
+function ibHostKeysOf(panel, inbounds) {
+  const out=[];
+  const add=(v)=>{
+    const x=ibHostNorm(v);
+    if(x && out.indexOf(x)<0) out.push(x);
+  };
+  try{ if(panel && panel.url) add(new URL(panel.url).host); }catch{}
+  if(panel){
+    add(panel.host);
+    add(panel.webDomain);
+    add(panel.domain);
+  }
+  for(const ib of (Array.isArray(inbounds)?inbounds:[])){
+    if(!ib) continue;
+    let st=ib.streamSettings;
+    if(typeof st==="string"){ try{ st=JSON.parse(st); }catch{ st=null; } }
+    if(!st || typeof st!=="object") continue;
+    for(const key of ["wsSettings","xhttpSettings","httpupgradeSettings","tlsSettings","realitySettings"]){
+      const o=st[key];
+      if(o && typeof o==="object"){ add(o.host); add(o.serverName); }
+    }
+    try{
+      const req=st.tcpSettings && st.tcpSettings.header && st.tcpSettings.header.request;
+      const hv=req && req.headers && req.headers.Host;
+      if(Array.isArray(hv)){ for(const x of hv) add(x); }
+      else if(typeof hv==="string"){ for(const x of String(hv).split(",")) add(x); }
+    }catch{}
+  }
+  return out;
+}
+async function ibSaveHosts(store, panelId, hosts) {
+  const h=[];
+  for(const v of (hosts||[])){
+    const x=ibHostNorm(v);
+    if(x && h.indexOf(x)<0) h.push(x);
+  }
+  if(!h.length) return;
+  try{ await store.put("ib:hosts:"+String(panelId), JSON.stringify({h,ts:Math.floor(Date.now()/1000)}), IB_HOSTS_TTL_S*2); }catch{}
+}
+// نگاشت «هاست ← پنل» از روی کش (بدون هیچ تماس شبکه‌ای)
+async function ibHostIndex(store, panels) {
+  const idx=new Map();
+  for(const p of (panels||[])){
+    if(!p) continue;
+    try{
+      const v=await store.get("ib:hosts:"+String(p.id));
+      if(!v) continue;
+      const o=(typeof v==="object")?v:JSON.parse(v);
+      for(const h of ((o&&o.h)||[])){
+        const x=String(h||"");
+        if(x && !idx.has(x)) idx.set(x,p);
+      }
+    }catch{}
+  }
+  return idx;
+}
+// گرم‌کردن کش هاست‌ها — چرخشی، چند پنل در هر اجرا (بودجهٔ subrequest محدود است)
+async function ibWarmHosts(store, panels, limit) {
+  let list=(panels&&panels.length)?panels:((await store.getPanels())||[]);
+  if(!list.length) return 0;
+  const n=Math.max(1, Math.min(Number(limit)||3, list.length));
+  let cur=0;
+  try{ cur=Number(await store.cache("ib.hostcur")||0)||0; }catch{}
+  if(!(cur>=0 && cur<list.length)) cur=0;
+  const sel=[];
+  for(let i=0;i<n;i++) sel.push(list[(cur+i)%list.length]);
+  try{ await store.setCache("ib.hostcur", (cur+n)%list.length, 86400); }catch{}
+  for(const p of sel){
+    if(!p) continue;
+    try{
+      const api=new PanelApi(p.name, p.url, p.token, p.id);
+      const ibs=await api.getInbounds();
+      await ibSaveHosts(store, p.id, ibHostKeysOf(p, ibs));
+    }catch(e){}
+  }
+  return sel.length;
+}
+function ibTimeout(p, ms) {
+  return Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")), ms))]);
+}
+// 🔌 f36: تشخیص پنل «همین حالا» از روی API خود پنل‌ها (وقتی کش هاست سرد است).
+// موازی و با سقف زمانی؛ نتیجه در کش می‌ماند تا بار بعد فوری باشد.
+async function ibResolveByInbounds(store, panels, host) {
+  const list=(panels||[]).filter(Boolean);
+  if(!host || !list.length) return null;
+  const nowS=Math.floor(Date.now()/1000);
+  const cacheOf=async(p)=>{
+    try{
+      const v=await store.get("ib:hosts:"+String(p.id));
+      if(!v) return null;
+      const o=(typeof v==="object")?v:JSON.parse(v);
+      return (o && Array.isArray(o.h)) ? o : null;
+    }catch{ return null; }
+  };
+  const cached=await Promise.all(list.map(cacheOf));
+  for(let i=0;i<list.length;i++){
+    const o=cached[i];
+    if(o && o.h.indexOf(host)>=0) return {panel:list[i], fetched:false};
+  }
+  const todo=[];
+  for(let i=0;i<list.length;i++){
+    const o=cached[i];
+    if(!(o && (nowS-Number(o.ts||0))<IB_HOSTS_TTL_S)) todo.push(list[i]);
+  }
+  if(!todo.length) return null;
+  const res=await Promise.all(todo.map(async(p)=>{
+    try{
+      const api=new PanelApi(p.name, p.url, p.token, p.id);
+      const ibs=await ibTimeout(api.getInbounds(), IB_SYNC_RESOLVE_MS);
+      const hs=ibHostKeysOf(p, ibs);
+      await ibSaveHosts(store, p.id, hs);
+      return (hs.indexOf(host)>=0) ? p : null;
+    }catch(e){ return null; }
+  }));
+  for(const r of res) if(r) return {panel:r, fetched:true};
+  return null;
+}
+// نگاشت «مسیر ← اینباند» از روی لیست اینباندهای پنل (بدون تماس شبکه‌ای)
+function ibMapOf(panel, ibs, out) {
+  if(out && typeof out==="object"){ try{ out.hosts=ibHostKeysOf(panel, ibs); }catch{} }
+  const map={};
+  for(const ib of (ibs||[])){
+    if(!ib || ib.enable===false) continue;
+    const name=(String(ib.remark==null?"":ib.remark).trim()) || ("اینباند "+String(ib.port||""));
+    const rec={id:String(ib.id), n:name};
+    const port=Number(ib.port)||0;
+    if(port>=8081 && port<=8089) map["/in"+String(port-8080)]=rec;
+    let st=ib.streamSettings;
+    if(typeof st==="string"){ try{ st=JSON.parse(st); }catch{ st=null; } }
+    if(st && typeof st==="object"){
+      const cand=[];
+      if(st.wsSettings && st.wsSettings.path) cand.push(st.wsSettings.path);
+      if(st.xhttpSettings && st.xhttpSettings.path) cand.push(st.xhttpSettings.path);
+      if(st.httpupgradeSettings && st.httpupgradeSettings.path) cand.push(st.httpupgradeSettings.path);
+      if(st.tcpSettings && st.tcpSettings.header && st.tcpSettings.header.request) cand.push(st.tcpSettings.header.request.path);
+      for(const p of cand){
+        const k=ibNormPath(p);
+        if(k && !map[k]) map[k]=rec;
+      }
+    }
+  }
+  return map;
+}
+async function ibBuildMap(panel, out) {
+  const api=new PanelApi(panel.name, panel.url, panel.token, panel.id);
+  const ibs=await api.getInbounds();
+  return ibMapOf(panel, ibs, out);
+}
+// هندلر /ib — همیشه سریع و بی‌خطا برمی‌گردد (خرابی‌اش نباید تونل را تحت تأثیر بگذارد)
+// 🔌 f37: هیچ تماس شبکه‌ای به پنل‌ها نمی‌زند؛ فقط وضعیت همان «هاست» را
+// می‌خواند/می‌نویسد. پس latency کم است و پوش nginx (مهلت ۶ ثانیه) امن می‌ماند.
+async function handleIbEvent(request, url, store) {
+  const q=url.searchParams;
+  const ok=new Response(null,{status:204,headers:{"Cache-Control":"no-store"}});
+  try{
+    const secret=await store.getIbSecret();
+    const given=String(q.get("k")||"");
+    if(!secret || !given || !timingSafeEq(given, secret)) return new Response(null,{status:403});
+    const ev=String(q.get("ev")||"").toLowerCase();
+    if(ev!=="open" && ev!=="close") return ok;
+    const path=ibNormPath(q.get("u"));
+    if(!path) return ok;
+    const ip=String(q.get("ip")||"").trim();
+    if(!/^[0-9a-fA-F:.]{3,45}$/.test(ip)) return ok;
+    const host=ibHostNorm(q.get("h"));
+    if(!host) return ok;
+    const nowS=Math.floor(Date.now()/1000);
+    try{
+      await store.withLock("ib:lk:h:"+host, 10, async()=>{
+        const st=(await store.getIbHostState(host))||{ips:{},ev:0};
+        st.ips=st.ips||{};
+        st.ev=Number(st.ev||0)+1;
+        st.last=nowS;
+        const per=st.ips[ip]||(st.ips[ip]={});
+        const cur=per[path]||(per[path]=[0,0]);
+        cur[0]=Math.max(0, Number(cur[0]||0)+(ev==="open"?1:-1));
+        cur[1]=nowS;
+        ibPrune(st, nowS);
+        await store.putIbHostState(host, st);
+      });
+    }catch(e){ /* قفل/شبکه — فقط همین رویداد از دست می‌رود */ }
+    return ok;
+  }catch(e){ return ok; }
+}
+
 class Bot {
   constructor(store,token,ctx){
     this.store=store; this.tg=new Tg(token); this.tg._store=store; this.token=token; this._ctx=ctx||null;
@@ -7105,6 +7476,46 @@ class Bot {
         panelLimitGB: limitGB,
       };
     }catch(e){ out.health={ok:false, error:String(e&&e.message||e).slice(0,120)}; }
+
+    // 🔌 f34: رویدادهای اینباند (کدام کاربر روی کدام اینباند) — خلاصه + آدرس پوش
+    try{
+      const panels0=(await this.store.getPanels())||[];
+      const nowS=Math.floor(Date.now()/1000);
+      let evTotal=0, panelsWith=0, activePairs=0, lastTs=0;
+      for(const p of panels0){
+        let hosts0=[];
+        try{
+          const hv=await this.store.get("ib:hosts:"+String(p.id));
+          if(hv){ const o=(typeof hv==="object")?hv:JSON.parse(hv); hosts0=(o&&o.h)||[]; }
+        }catch{}
+        let anyState=false;
+        for(const h of hosts0){
+          const st=await this.store.getIbHostState(h);
+          if(!st) continue;
+          anyState=true;
+          evTotal+=Number(st.ev||0);
+          for(const ip in (st.ips||{})){
+            for(const k in (st.ips[ip]||{})){
+              const e=st.ips[ip][k]||[];
+              if(Number(e[0]||0)>0 && (nowS-Number(e[1]||0))<=IB_TTL_S) activePairs++;
+            }
+          }
+          if(Number(st.last||0)>lastTs) lastTs=Number(st.last||0);
+        }
+        if(anyState) panelsWith++;
+      }
+      const sec=await this.store.getIbSecret();
+      let origin="";
+      try{ origin=String(await this.store.get(KEYS.WEBHOOK_URL)||""); }catch{}
+      out.inboundEvents={
+        pushUrl: (sec && origin) ? (origin.replace(/\/+$/,"")+"/ib?k="+sec) : null,
+        events: evTotal,
+        panelsWithEvents: panelsWith,
+        activePairs,
+        lastEventAgeSec: lastTs ? (nowS-lastTs) : null,
+        ttlSec: IB_TTL_S,
+      };
+    }catch(e){ out.inboundEvents={error:String(e&&e.message||e).slice(0,120)}; }
 
     return out;
   }
@@ -13962,19 +14373,26 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const title=onlyPublic
       ? uiHead("🟢", L(lang,"آنلاین عمومی","Public online"), L(lang,"کاربران ربات عمومی","Public-bot users"))
       : uiHead("🟢", L(lang,"آنلاین","Online"), L(lang,"کاربران عادی متصل","Connected normal users"));
-    // 🆕 UI پیشرفته‌تر: زمان + جمع در هدر
-    const lines=[title, "🕐  "+homeClock()+L(lang,"   ·   جمع  ·  *","   ·   total  ·  *")+"0*"];
-    // 🔀 f32b: بدون دکمه (بازخورد میدانی: لیست شلوغ پر از دکمه می‌شد) —
-    //    در خودِ متن: نام لینک → پروفایل شخصی، آیدی عددی لینک → کارت کاربر در ربات
-    lines.push(L(lang,"_🟢 نام → اکانت شخصی  ·  آیدی → کانفیگ در ربات_","_🟢 name → profile  ·  ID → bot account_"));
-    const _hdrIdx=lines.length-1;
+    const lines=[title];
     let totalCount=0;      // مجموع واقعی آنلاین‌ها (حتی اگر در متن جا نشوند)
+    let _panelCnt=0;       // چند پنل در این جمع سهیم‌اند
     let shownCount=0;      // تعدادی که واقعاً چاپ شد
     let truncated=false;
     const failed=[];
     const MAX_CHARS=3500;
     const globalSeen=new Set();   // ضد تکرار بین چند پنل (یک کاربر روی ۲ پنل)
+    // 👤 f33b: نگاشت «ایمیل پنل ← شناسهٔ عددی تلگرام» از رکوردهای کاربران ربات
+    const uidByEmail=new Map();
+    for(const _uidK of Object.keys(users||{})){
+      const _u=users[_uidK];
+      if(!_u) continue;
+      const _ue=String(_u.email||"").toLowerCase().trim();
+      if(_ue && !uidByEmail.has(_ue)) uidByEmail.set(_ue,String(_uidK));
+    }
     let _botUname=null;           // 🔀 f32b: برای لینک عمیق آیدی (تنبل؛ کش ۲۴h)
+    // 🤖 f33d: نام کاربری ربات یک‌بار برای همهٔ ردیف‌ها (قبلاً داخل حلقه و شرطی بود؛
+    //    اگر getMe یک‌بار شکست می‌خورد، همان ردیف‌ها قالب دیگری می‌گرفتند — همان بی‌نظمی لیست)
+    if(_botUname===null){ try{ _botUname=String((await this._botUsername())||""); }catch{ _botUname=""; } }
     const planBackfill=[];        // رکوردهای قدیمی که planName نداشتند
 
     for(const p of panels){
@@ -13985,8 +14403,26 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       if(!ok){ failed.push(p.name); continue; }
       if(!online.length) continue;
 
-      let lastOnlineMap=null;
-      try{ lastOnlineMap=await api.getLastOnline(); }catch{ lastOnlineMap=null; }
+      // 📱 f33: نقشهٔ «ایمیل ← IPهای متصل» (یک درخواست برای کل پنل)
+      // 📱 f33 + 🔌 f37: IPهای هر کاربر و لیست اینباندها (برای نام اینباند)
+      let ipMap=new Map();
+      let ibInbounds=[];
+      try{
+        const _pr=await Promise.all([api.getAllClientIps(), api.getInbounds()]);
+        ipMap=_pr[0]||new Map(); ibInbounds=_pr[1]||[];
+      }catch(e){
+        try{ ipMap=await api.getAllClientIps(); }catch{}
+      }
+      // 🔌 f37: رویدادهای اینباندِ همهٔ هاست‌های این پنل (دامنهٔ پنل + هاست داخل
+      // اینباندها) — کلیدها مسیرند و نام تازه از لیست اینباندها حل می‌شود.
+      let ibStates=[], ibMap=null;
+      try{
+        ibMap=ibMapOf(p, ibInbounds);
+        for(const _h of ibHostKeysOf(p, ibInbounds)){
+          const _st=await this.store.getIbHostState(_h);
+          if(_st) ibStates.push(_st);
+        }
+      }catch{}
       const emails=[];
       for(const u of online){
         const em=typeof u==="string"?u:(u&& (u.email||u.clientEmail)||"");
@@ -14020,6 +14456,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       }
 
       totalCount+=emails.length;
+      _panelCnt++;
       if(truncated) continue;   // دیگر چاپ نکن ولی شمارش را ادامه بده
 
       if(lines.length>2) lines.push("━━━━━━━━━━━━━━");
@@ -14027,19 +14464,23 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       for(let i=0;i<emails.length;i++){
         const em=emails[i];
         const emKey=String(em).toLowerCase().trim();
-        const uid0=uidFromEmail(em);
-        // 🔀 f32b: برچسب متنی — نام لینک‌دار (پروفایل) + آیدی لینک‌دار (deep-link به کارت کاربر)
+        const uid0=uidFromEmail(em)||uidByEmail.get(emKey)||"";
+        const _bu=uid0?(users[String(uid0)]||null):null;
+        const _uname=_bu&&_bu.username?String(_bu.username).replace(/^@+/,"").trim():"";
+        let _nm=_bu?(((_bu.firstName||"")+" "+(_bu.lastName||"")).trim()||""):"";
+        // 📋 f33d — قالبِ ثابت و مرتب برای همهٔ ردیف‌ها:
+        //    نام · @یوزرنیم · آیدی عددی · 📱تعداد · [قالب]
         let label;
-        if(uid0){
-          if(!_botUname) _botUname=await this._botUsername();
-          const bu=users[String(uid0)];
-          let nm=bu?(((bu.firstName||"")+" "+(bu.lastName||"")).trim()||(bu.username?("@"+bu.username):"")):"";
-          if(!nm) nm=String(uid0);
-          label=_botUname
-            ? (tgUserLink(uid0, nm)+" ("+"["+uid0+"](https://t.me/"+_botUname+"?start=card_"+uid0+")"+")")
-            : formatUserEmailLinked(em, users);
+        if(!uid0){
+          label=esc(String(em));                 // کاربر بدون رکورد ربات → فقط ایمیل پنل
         } else {
-          label=formatUserEmailLinked(em, users);
+          // 🔗 f33e: نام → چت تلگرام · آیدی عددی → کارت کانفیگ
+          //    (payload همان چیزی است که /start پارس می‌کند: card_<uid> با زیرخط)
+          const _disp=_nm||(_uname?("@"+_uname):"");
+          const _card=_botUname
+            ? ("["+uid0+"](https://t.me/"+_botUname+"?start=card_"+uid0+")")
+            : uid0;
+          label=_disp ? (tgUserLink(uid0,_disp)+" · "+_card) : _card;
         }
         let planTag="";
         if(onlyPublic){
@@ -14050,22 +14491,20 @@ if(active && active.reachable && active.client && !active.expired && !active.not
             const inf=inferPlanFromClient(cl, plans);
             if(inf && uid0) planBackfill.push({uid:uid0, planId:String(inf.id), planName:String(inf.name||pn)});
           }
-          planTag=pn ? ("  *["+esc(pn)+"]*") : L(lang,"  _[نامشخص]_","  _[unknown]_");
+          planTag=pn ? (" · *["+esc(pn)+"]*") : L(lang," · _[نامشخص]_"," · _[unknown]_");
         }
-        // 🕒 f32f: آخرین ترافیک کاربر (اگر پنل بدهد) — زنده‌بودن اتصال در خود لیست دیده می‌شود
-        let _agoTag="";
-        try{
-          const _lv=Number((lastOnlineMap&&(lastOnlineMap[em]||lastOnlineMap[emKey]))||0);
-          if(_lv>0){
-            const _sec=Math.max(0,Math.round((Date.now()-_lv)/1000));
-            const _ago=_sec<60 ? L(lang,"لحظه‌ای پیش","just now")
-              : _sec<3600 ? Math.floor(_sec/60)+L(lang," دقیقه پیش","m ago")
-              : Math.floor(_sec/3600)+L(lang," ساعت پیش","h ago");
-            _agoTag=L(lang,"  ·  ⏱ ","  ·  ⏱ ")+_ago;
-          }
-        }catch{}
+        // 📱 f33d: فقط اموجی گوشی + عدد
+        let devTag="";
+        const _devIps=ipMap.get(emKey);
+        if(_devIps && _devIps.length) devTag=" · 📱"+_devIps.length;
+        // 🔌 f34: نام اینباندهایی که همین کاربر (با همین IPها) الان ازشان وصل است
+        //    چند اینباند هم‌زمان ⇒ همه، به‌ترتیب جدیدترین. اگر معلوم نباشد ⇒ چیزی اضافه نمی‌شود.
+        if(ibStates.length && _devIps && _devIps.length){
+          const _ibs=ibActiveNames(ibStates, ibMap, _devIps);
+          if(_ibs.length) devTag+=" "+_ibs.map((_n)=>"["+esc(_n)+"]").join(" ");
+        }
         // label لینک‌دار است — بک‌تیک نگذار چون داخل code span لینک رندر نمی‌شود.
-        lines.push("🟢 "+label+_agoTag+planTag);
+        lines.push("🟢 "+label+planTag+devTag);
         shownCount++;
         if(lines.join("\n").length>MAX_CHARS){
           truncated=true;
@@ -14083,9 +14522,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     if(totalCount===0) lines.push(onlyPublic?L(lang,"کاربر عمومی آنلاینی نیست.","No public users online."):L(lang,"کاربر آنلاینی نیست.","No users online."));
     if(failed.length) lines.push(L(lang,"⚠️ پنل در دسترس نبود: ","⚠️ Unreachable panel: ")+failed.map(esc).join("، "));
     lines.push("━━━━━━━━━━━━━━");
-    lines.push(L(lang,"🟢  آنلاین  ·  *","🟢  Online  ·  *")+totalCount+"*");
-    // 🆕 بروزرسانی زندهٔ جمع در هدر
-    if(_hdrIdx>0) lines[_hdrIdx]="🕐  "+homeClock()+L(lang,"   ·   جمع  ·  *","   ·   total  ·  *")+totalCount+"*";
+    lines.push(L(lang,"🟢  آنلاین  ·  ","🟢  Online  ·  ")+"*"+totalCount+"*"+(onlyPublic?L(lang," کاربر عمومی"," public user"):L(lang," کاربر عادی"," normal user"))+(_panelCnt>1?L(lang,"  ·  از "+_panelCnt+" پنل","  ·  from "+_panelCnt+" panels"):""));
 
     // ترمیم رکوردهای قدیمی فقط بعد از آماده‌شدن خروجی؛ خطای ذخیره‌سازی نباید نمایش آنلاین را خراب کند.
     if(planBackfill.length){
@@ -20258,6 +20695,8 @@ export default {
         await runLocked("notify_down", 1800, () => bot0.notifyUsersOnDeadPanels({max:8})); // f3: 25→8 — هر پنل یک subrequest؛ سقف invocation حفظ شود
         // صفحهٔ خانه را همان‌جا ویرایش کن (پیام جدید نفرست)
         await runLocked("home_refresh", 180, () => bot0.refreshLiveHomes()); // f3: 60→180 — خانهٔ زنده هر ۳ دقیقه تازه شود، نه هر دور
+        // 🔌 f35: کش «هاست اینباند ← پنل» چرخشی تازه شود (برای تشخیص پنل در /ib)
+        await runLocked("ib_hosts", 600, () => ibWarmHosts(store, null, 3));
       }
     }catch(e){ console.error("scheduled bot init", e&&e.message); }
 
@@ -21217,6 +21656,9 @@ export default {
     const store=new Store(kv, db);
     try{ await store.ready(); }catch{}
 
+    // 🔌 f34: رویداد اینباند از nginx پنل (باز/بسته شدن تونل) — بدون وب‌هوک و بدون لاگ
+    if(url.pathname==="/ib") return await handleIbEvent(request, url, store, ctx);
+
     // ---- Auto Webhook Registration ----
     // Register if never done; also re-check daily (helps after CF deploy)
     const webhookUrl = url.origin + "/webhook";
@@ -21469,7 +21911,7 @@ export default {
               for(const row of rows){
                 if(!row||!row.clientEmail) continue;
                 let list=[];
-                try{ const a=JSON.parse(row.ips||"[]"); if(Array.isArray(a)) list=a; }catch{}
+                { let a=row.ips; if(typeof a==="string"){ try{ a=JSON.parse(a||"[]"); }catch{ a=[]; } } if(Array.isArray(a)) list=a; }
                 const ips=list.map(e=>typeof e==="string"?e:((e&&e.ip)||"")).filter(Boolean);
                 byEmail.set(String(row.clientEmail).toLowerCase(), ips);
               }
@@ -21479,6 +21921,16 @@ export default {
             }catch(e){
               ipProbe.mode="legacy";
             }
+            // 🔌 f37: وضعیت رویدادها برای همهٔ هاست‌های این پنل
+            let ibStates=[], ibMap=null;
+            try{
+              const _ibs2=await api.getInbounds();
+              ibMap=ibMapOf(panel, _ibs2);
+              for(const _h of ibHostKeysOf(panel, _ibs2)){
+                const _st=await store.getIbHostState(_h);
+                if(_st) ibStates.push(_st);
+              }
+            }catch{}
             for(const em of emails.slice(0,8)){
               const key=String(em).toLowerCase();
               let ips=null;
@@ -21500,7 +21952,8 @@ export default {
               } else {
                 ips=[];
               }
-              ipProbe.perClient.push({email:mask(em), conns:(ips||[]).length, sample:(ips||[]).slice(0,3).map(maskIp)});
+              ipProbe.perClient.push({email:mask(em), conns:(ips||[]).length, sample:(ips||[]).slice(0,3).map(maskIp),
+                ib:ibActiveNames(ibStates, ibMap, ips||[])});
             }
           }
           let lastOnlineMap={};
@@ -21663,6 +22116,65 @@ export default {
     }
 
     // 🔍 گزارش عیب‌یابی — فقط خواندنی، با توکن کوتاه‌عمر
+    // 🔌 f34: وضعیت رویدادهای اینباند — /diag/ib?panelId=43
+    if(url.pathname==="/diag/ib"&&(request.method==="GET"||request.method==="HEAD")){
+      const a=await diagAuth(request, store);
+      if(a.err) return a.err;
+      const maskIp=(ip)=>{const p=String(ip).split(".");return p.length===4?(p[0]+"."+p[1]+".*.*"):(String(ip).slice(0,10)+"…");};
+      const panels0=(await store.getPanels())||[];
+      const pid=String(url.searchParams.get("panelId")||"").trim();
+      const nowS=Math.floor(Date.now()/1000);
+      const out=[];
+      for(const p of panels0){
+        if(pid && String(p.id)!==pid) continue;
+        let hosts=[], map=null, err=null;
+        try{
+          const api=new PanelApi(p.name, p.url, p.token, p.id);
+          const ibs=await api.getInbounds();
+          hosts=ibHostKeysOf(p, ibs);
+          map=ibMapOf(p, ibs);
+        }catch(e){ err=String((e&&e.message)||e).slice(0,80); }
+        const states=[], active=[], seen=new Set();
+        let ev=0, last=0, hostsWith=0;
+        for(const h of hosts){
+          const st=await store.getIbHostState(h);
+          if(!st) continue;
+          hostsWith++;
+          ev+=Number(st.ev||0);
+          if(Number(st.last||0)>last) last=Number(st.last||0);
+          for(const ip in (st.ips||{})){
+            const per=st.ips[ip]||{};
+            for(const pa in per){
+              const e=per[pa]||[];
+              const c=Number(e[0]||0), t=Number(e[1]||0);
+              if(c<=0 || (nowS-t)>IB_TTL_S) continue;
+              const key=ip+"|"+pa;
+              if(seen.has(key)) continue; seen.add(key);
+              const hit=map?ibMatch(map, pa):null;
+              active.push({ip:maskIp(ip), path:pa, name:hit?String(hit.n||""):"", conns:c, ageSec:nowS-t});
+            }
+          }
+        }
+        out.push({panel:String(p.id), name:p.name||"", hosts, events:ev, hostsWithEvents:hostsWith,
+          lastAgeSec:last?(nowS-last):null, error:err||undefined, active});
+      }
+      return new Response(JSON.stringify({ok:true, now:nowS, panels:out},null,2),
+        {status:200,headers:{"Content-Type":"application/json; charset=utf-8",...a.secHeaders}});
+    }
+
+    // 🔌 f34: رندر زندهٔ لیست آنلاین و ارسال به مالک (تست مارک‌داون) — /diag/render?view=normal
+    if(url.pathname==="/diag/render"&&(request.method==="GET"||request.method==="POST")){
+      const a=await diagAuth(request, store);
+      if(a.err) return a.err;
+      const token0=await store.getToken();
+      const bot0=new Bot(store, token0, ctx);
+      bot0._uid=await bot0.ownerId();
+      const onlyPublic=String(url.searchParams.get("view")||"")==="pub";
+      await bot0._renderOnline(bot0._uid, null, {onlyPublic, backCb:"m:main", updateCb:onlyPublic?"ol:pub":"ol:norm"});
+      return new Response(JSON.stringify({ok:true, sent:true, view:onlyPublic?"public":"normal"}),
+        {status:200,headers:{"Content-Type":"application/json; charset=utf-8",...a.secHeaders}});
+    }
+
     if(url.pathname==="/diag"&&(request.method==="GET"||request.method==="HEAD")){
       // هدرهای امنیتی: نه کش شود، نه ایندکس، نه در iframe
       const secHeaders={
