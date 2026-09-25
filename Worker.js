@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-25-f38";
+const CODE_STAMP = "2026-09-25-f41";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -1374,10 +1374,14 @@ function tsMs(v) {
   const d = Date.parse(String(v));
   return (Number.isFinite(d) && d > 0) ? d : 0;
 }
-function userWarn80Key(uid, email, panelId, total, exp, startTs) {
+function userWarn80Key(uid, email, panelId, total, exp, startTs, kind) {
+  // 🔴 f39: پیام «تمام شد» کلید جدا دارد تا اگر هشدار ۸۰٪ قبلاً رفته بود،
+  //    پیام نهایی هم به کاربر برسد (قبلاً یک کلید برای همه ⇒ سکوت).
+  const k = String(kind||"");
+  const suf = (k==="done_traffic"||k==="done_time") ? (":"+k) : "";
   return "u:warn80:v2:" + String(uid) + ":" + String(email || "").toLowerCase() + ":" +
     String(panelId == null ? "" : panelId) + ":" + Math.floor((Number(startTs)||0)/60000) + ":" +
-    Math.floor((Number(exp)||0)/60000) + ":" + Math.round(Number(total)||0);
+    Math.floor((Number(exp)||0)/60000) + ":" + Math.round(Number(total)||0) + suf;
 }
 function userWarn80State(used, total, exp, startTs, now) {
   const t = Number(total)||0;
@@ -1393,6 +1397,17 @@ function userWarn80State(used, total, exp, startTs, now) {
   else if (e>0 && e<=n) { timePct = 100; leftTxt = "تمام شده"; }
   if (e>0 && st>0 && e>st) {
     timePct = Math.min(100, Math.max(0, Math.floor(((n-st)/Math.max(1,e-st))*100)));
+  }
+  // 🔴 f39: حالت «تمام شد». قبلاً اگر مصرفِ یک کاربر بین دو بررسی از زیر ۸۰٪
+  //    می‌پرید به ۱۰۰٪ (مصرف سریع یا جاافتادن در دور کران)، هیچ‌وقت هشدار
+  //    نمی‌گرفت و خودش می‌دید که کانفیگ تمام/غیرفعال شده — بدون هیچ پیامی.
+  //    الان «تمام شدنِ حجم» و «تمام شدنِ زمان» هم وضعیت مستقل دارند و پیام
+  //    مخصوص خودشان (با کلید جدا) فرستاده می‌شود.
+  const doneTraffic = t>0 && u>=t;
+  const doneTime = e>0 && n>=e;
+  if (doneTraffic || doneTime) {
+    return {kind: doneTraffic ? "done_traffic" : "done_time", volPct, timePct,
+      used:u, total:t, remB, exp:e, startTs:st, leftTxt, done:true};
   }
   const hitVol = t>0 && volPct >= 80;
   const hitTime = timePct >= 80;
@@ -1420,29 +1435,165 @@ function userWarn80RawPcts(used, total, exp, startTs, now) {
   if(e>0&&st>0&&e>st) timePct=Math.min(100,Math.max(0,Math.floor(((n-st)/Math.max(1,e-st))*100)));
   return {volPct, timePct};
 }
-/** یک پیام هشدار ۸۰٪ — فقط برای همان موردی که اول به مرز رسیده است */
-function userEightyNotice(used, total, exp, startTs, now) {
-  const st = userWarn80State(used, total, exp, startTs, now);
+/**
+ * متن هشدار ۸۰٪ / پیام «تمام شد» — 🌐 f39: کاملاً دوزبانه به زبانِ خودِ کاربر.
+ * ورودی می‌تواند شیء وضعیت باشد (خروجی userWarn80State) یا همان آرگومان‌های عددی.
+ */
+function userEightyNotice(a, b, c, d, e, f) {
+  const st = (a && typeof a === "object") ? a : userWarn80State(a, b, c, d, e);
+  const lang = (typeof b === "string") ? b : ((typeof f === "string") ? f : "fa");
   if (!st) return null;
-  if (st.kind === "traffic") {
+  const used=Number(st.used)||0, total=Number(st.total)||0, rem=Number(st.remB)||0;
+  const gb=(x)=>fmtGib(x);
+  if (st.kind === "done_traffic") {
     return [
-      "⚠️ *هشدار مصرف حجم*",
+      L(lang, "🚫 *حجم کانفیگ شما تمام شد*", "🚫 *Your data allowance is used up*"),
       "",
-      "شما حدود *"+st.volPct+"٪* حجم کانفیگ خود را مصرف کرده‌اید.",
-      "مصرف‌شده  ·  *"+fmtGib(st.used)+"* از *"+fmtGib(st.total)+"* گیگابایت",
-      "باقی‌مانده  ·  *"+fmtGib(st.remB)+"* گیگابایت",
+      L(lang, "مصرف‌شده  ·  *", "Used  ·  *") + gb(used) + L(lang, "* از *", "* of *") + gb(total) + L(lang, "* گیگابایت", "* GB"),
+      L(lang, "کانفیگ شما موقتاً غیرفعال شد تا پایان این دوره.", "Your config was temporarily disabled until the end of this period."),
       "",
-      "برای جزئیات بیشتر از دکمهٔ «اکانت من» استفاده کنید."
+      L(lang, "برای دیدن جزئیات از دکمهٔ «اکانت من» استفاده کنید.", "Tap \"My account\" for details."),
+    ].join("\n");
+  }
+  if (st.kind === "done_time") {
+    return [
+      L(lang, "⏰ *زمان کانفیگ شما تمام شد*", "⏰ *Your subscription has ended*"),
+      "",
+      L(lang, "این دوره به پایان رسید. هر زمان خواستید می‌توانید از ربات کانفیگ جدید بگیرید.",
+               "This period is over. You can get a new config from the bot anytime."),
+      (Number(st.volPct) > 0 ? (L(lang, "مصرف‌شده  ·  *", "Used  ·  *") + Number(st.volPct) + "%*") : ""),
+    ].filter(Boolean).join("\n");
+  }
+  if (st.kind === "time") {
+    return [
+      L(lang, "⚠️ *هشدار اعتبار زمانی*", "⚠️ *Validity warning*"),
+      "",
+      L(lang, "حدود *", "About *") + Number(st.timePct) + L(lang, "٪* از زمان کانفیگ شما گذشته است.", "%* of your config's time has passed."),
+      L(lang, "باقی‌مانده  ·  *", "Remaining  ·  *") + String(st.leftTxt || "—") + "*",
+      "",
+      L(lang, "برای جزئیات بیشتر از دکمهٔ «اکانت من» استفاده کنید.", "Tap \"My account\" for more details."),
     ].join("\n");
   }
   return [
-    "⚠️ *هشدار اعتبار زمانی*",
+    L(lang, "⚠️ *هشدار مصرف حجم*", "⚠️ *Data usage warning*"),
     "",
-    "حدود *"+st.timePct+"٪* از زمان کانفیگ شما گذشته است.",
-    "باقی‌مانده  ·  *"+st.leftTxt+"*",
+    L(lang, "شما حدود *", "You have used about *") + Number(st.volPct) + L(lang, "٪* حجم کانفیگ خود را مصرف کرده‌اید.", "%* of your config's data."),
+    L(lang, "مصرف‌شده  ·  *", "Used  ·  *") + gb(used) + L(lang, "* از *", "* of *") + gb(total) + L(lang, "* گیگابایت", "* GB"),
+    L(lang, "باقی‌مانده  ·  *", "Remaining  ·  *") + gb(rem) + L(lang, "* گیگابایت", "* GB"),
     "",
-    "برای جزئیات بیشتر از دکمهٔ «اکانت من» استفاده کنید."
+    L(lang, "برای جزئیات بیشتر از دکمهٔ «اکانت من» استفاده کنید.", "Tap \"My account\" for more details."),
   ].join("\n");
+}
+/** 🐢 f39: هشدار دیرهنگام — وقتی «بالاترین درصدِ دیده‌شده» از ۸۰ گذشته ولی
+ *  نمونهٔ فعلی زیر ۸۰ است (مثلاً دادهٔ پنل ریست شده یا کران کاندید را جا انداخته). */
+function userLateNotice(hiPct, kind, lang) {
+  const hi=Math.max(0, Math.round(Number(hiPct)||0));
+  if(!(hi>=80)) return null;
+  if(kind==="time"){
+    return [
+      L(lang, "⚠️ *هشدار اعتبار زمانی*", "⚠️ *Validity warning*"),
+      "",
+      L(lang, "زمان کانفیگ شما از *", "Your config's time passed the *") + hi + L(lang, "٪* گذشته بود.", "%* mark."),
+      L(lang, "برای جزئیات از دکمهٔ «اکانت من» استفاده کنید.", "Tap \"My account\" for details."),
+    ].join("\n");
+  }
+  return [
+    L(lang, "⚠️ *هشدار مصرف حجم*", "⚠️ *Data usage warning*"),
+    "",
+    L(lang, "مصرف شما از *", "Your usage passed the *") + hi + L(lang, "٪* گذشته بود.", "%* mark."),
+    L(lang, "برای جزئیات از دکمهٔ «اکانت من» استفاده کنید.", "Tap \"My account\" for details."),
+  ].join("\n");
+}
+/**
+ * ✅ f39: تصمیم نهایی «چه پیامی برای این کانفیگ بفرستیم؟» در یک جا.
+ * خروجی: {kind, text, keyKind} یا null.
+ *   kind: traffic | time | done_traffic | done_time | late
+ */
+function userQuotaNotice(used, total, exp, startTs, now, lang, hiPct) {
+  const st=userWarn80State(used, total, exp, startTs, now);
+  if(st){
+    const text=userEightyNotice(st, lang);
+    if(text) return {kind: st.kind, keyKind: st.kind, text};
+  }
+  // هیچ وضعیت تازه‌ای نیست ⇒ اگر قبلاً از ۸۰٪ گذشته بود، لااقل یک‌بار خبر بده
+  const hi=Number(hiPct)||0;
+  if(hi>=80){
+    const kind=(Number(total)>0)?"traffic":"time";
+    const text=userLateNotice(hi, kind, lang);
+    if(text) return {kind:"late", keyKind:"", text};
+  }
+  return null;
+}
+// ═══════════ 🌐 f40: صندوق ارسال هشدارها (outbox) ═══════════
+// چرا؟ سقف «subrequest» هر اجرای Worker حدود ۵۰ است. بلوکِ هشدار، آخرِ زنجیرهٔ
+// کران اجرا می‌شد؛ بعد از اسکنِ پنل‌ها و حلقهٔ پاک‌سازی، بودجه تمام شده بود و
+// ارسالِ پیام با خطای «Too many subrequests» می‌خورد. نتیجه: کاربری که حجمش
+// تمام می‌شد *هیچ* پیامی نمی‌گرفت — همان چیزی که کاربر گزارش کرد.
+// راه‌حل: هشدارها در صندوق صف می‌شوند و در «ابتدای» اجرای بعدی کران — با
+// بودجهٔ کاملاً تازه — با سقف کوچک ارسال می‌شوند.
+const W80_OUTBOX = "warn80:outbox";
+const W80_FLUSH_MAX = 6;      // حداکثر ارسال در هر اجرا (هر ارسال = ۱ subrequest)
+const W80_OUTBOX_CAP = 40;    // سقف صندوق
+function isSubreqErr(x){
+  const m = String((x && (x.message || x.description)) || x || "");
+  return /too many subrequests|subrequests|worker_invocation|exceeded/i.test(m);
+}
+async function warn80OutboxRead(store){
+  try{
+    const raw = await store.get(W80_OUTBOX);
+    const arr = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : [];
+    return Array.isArray(arr) ? arr.filter(x => x && x.uid != null && x.uid !== "" && x.k && x.text) : [];
+  }catch{ return []; }
+}
+async function warn80OutboxWrite(store, arr){
+  try{ await store.put(W80_OUTBOX, JSON.stringify((arr || []).slice(-W80_OUTBOX_CAP))); }catch{}
+}
+/** یک قلم به صندوق اضافه کن (کلید تکراری اضافه نشود). */
+async function warn80QueuePush(store, item){
+  if(!item || !item.uid || !item.k || !item.text) return false;
+  const arr = await warn80OutboxRead(store);
+  if(arr.some(x => x.k === item.k)) return false;
+  if(arr.length >= W80_OUTBOX_CAP) return false;
+  arr.push(item);
+  await warn80OutboxWrite(store, arr);
+  return true;
+}
+/** ارسال تا `max` قلم از صندوق — ابتدای هر اجرای کران صدا زده می‌شود. */
+async function warn80Flush(store, tg, max){
+  const arr = await warn80OutboxRead(store);
+  if(!arr.length) return {sent:0, left:0};
+  const cap = Math.max(1, Number(max) || W80_FLUSH_MAX);
+  const rest = []; let sent = 0, died = false;
+  for(const it of arr){
+    if(sent >= cap || died){ rest.push(it); continue; }
+    try{ if(await store.cache(it.k)) continue; }catch{}                 // قبلاً رفته
+    try{ if(await store.cache(it.k + ":fail")) continue; }catch{}       // ردّ دائمی
+    let ok = null;
+    try{ ok = await tg.msg(it.uid, it.text); }
+    catch(e){ ok = {ok:false, description:String((e && e.message) || e)}; }
+    if(ok && ok.ok !== false){
+      sent++;
+      try{ await store.setCache(it.k, true, 400*86400); }catch{}
+      try{ await store.pushLog({action:"user_warn80", detail:"uid="+it.uid+" kind="+String(it.kind||"")+" src="+String(it.src||"queue"), by:"cron", meta:null}); }catch{}
+      continue;
+    }
+    const ec = Number(ok && ok.error_code) || 0;
+    if(ec === 403 || ec === 404){
+      try{ await store.setCache(it.k + ":fail", true, 86400); }catch{}   // بلاک/چت ناموجود
+      continue;
+    }
+    if(isSubreqErr(ok)){
+      // بودجهٔ همین اجرا تمام شد ⇒ بقیه برای اجرای بعد (بودجهٔ تازه) بمانند
+      died = true; rest.push(it);
+      try{ await store.pushLog({action:"user_warn80_retry", detail:"uid="+it.uid+" budget_died src="+String(it.src||""), by:"cron", meta:null}); }catch{}
+      continue;
+    }
+    it.tries = (Number(it.tries) || 0) + 1;
+    if(it.tries >= 5){ try{ await store.setCache(it.k + ":fail", true, 3600); }catch{} }
+    else rest.push(it);
+  }
+  await warn80OutboxWrite(store, rest);
+  return {sent, left:rest.length, died};
 }
 /**
  * شروع بازهٔ زمانی کانفیگ برای هشدار ۸۰٪.
@@ -7375,7 +7526,7 @@ class Bot {
           if(!_any) _wNoTraffic.add(_pid);
         }
       }
-      let _wfb=20;
+      let _wfb=8;   // f41: مثل خودِ کران (بودجهٔ fetch تکی هر اجرا)
       const _nowW=Date.now();
       const _rows=[];
       for(const _meta of _wCands){
@@ -7433,7 +7584,7 @@ class Bot {
         else if(!_stt){ r.blocked="below_80"; }
         else {
           r.hit=true;
-          const _k=userWarn80Key(_meta.uid,_em,_pid,_total,_exp,_st);
+          const _k=userWarn80Key(_meta.uid,_em,_pid,_total,_exp,_st,_stt?_stt.kind:"");
           let _dup=false,_fail=false;
           try{ _dup=!!(await this.store.cache(_k)); }catch{}
           try{ _fail=!!(await this.store.cache(_k+":fail")); }catch{}
@@ -7444,8 +7595,10 @@ class Bot {
         _rows.push(r);
       }
       let _w80cur=0; try{ _w80cur=Number(await this.store.get("warn80:fb_cursor"))||0; }catch{}
+      let _obox=[]; try{ _obox=await warn80OutboxRead(this.store); }catch{}
       out.warn80={
-        singleFetchBudget:{start:20,left:_wfb,cursor:_w80cur},
+        outbox:{count:_obox.length, cap:40, flushMax:6, items:_obox.slice(0,10).map(x=>({uid:String(x.uid).slice(0,4)+"…", kind:x.kind, src:x.src, tries:x.tries||0}))},
+        singleFetchBudget:{start:8,left:_wfb,cursor:_w80cur},
         noTrafficPanels:[..._wNoTraffic],
         panelListErr:Object.fromEntries([..._wLists].filter(([,v])=>v.err).map(([k,v])=>[k,v.err])),
         candidatesCount:_rows.length,
@@ -8488,12 +8641,14 @@ class Bot {
         const compDays=Math.round((Number(active.compensatedMs)||0)/86400000);
         const expTs=Number(active.newExpiryTime)||0;
         const daysLeft=expTs>0?Math.max(0,Math.ceil((expTs-Date.now())/86400000)):0;
-        let txt="🔄 *کانفیگ شما جابه‌جا شد*\n\n"
-          +"به دلیل اشکال فنی در سرور قبلی، کانفیگ قدیمی از کار افتاد و روی سرور جدید بازسازی شد.\n\n"
-          +"📦 حجم باقی‌مانده: *"+(remGB>=0.01?remGB.toFixed(2):"0")+" گیگ* (حفظ شد)\n"
-          +"⏳ اعتبار باقی‌مانده: *"+daysLeft+" روز*";
-        if(compDays>0) txt+="\n🎁 *"+compDays+" روز* بابت مدت خاموشی سرور جبران شد.";
-        txt+="\n\n⚠️ لینک قدیمی دیگر کار نمی‌کند — لینک جدید را جایگزین کنید.";
+        // 🌐 f41: این پیام هم به زبان خودِ کاربر
+        const _ml=await this.userLang(uid);
+        let txt=L(_ml,"🔄 *کانفیگ شما جابه‌جا شد*\n\n","🔄 *Your config was moved*\n\n")
+          +L(_ml,"به دلیل اشکال فنی در سرور قبلی، کانفیگ قدیمی از کار افتاد و روی سرور جدید بازسازی شد.\n\n","Due to a technical problem on the previous server, your old config stopped working and was rebuilt on a new server.\n\n")
+          +L(_ml,"📦 حجم باقی‌مانده: *","📦 Data left: *")+(remGB>=0.01?remGB.toFixed(2):"0")+L(_ml," گیگ* (حفظ شد)\n"," GB* (kept)\n")
+          +L(_ml,"⏳ اعتبار باقی‌مانده: *","⏳ Time left: *")+daysLeft+L(_ml," روز*"," days*");
+        if(compDays>0) txt+=L(_ml,"\n🎁 *"+compDays+" روز* بابت مدت خاموشی سرور جبران شد.","\n🎁 *"+compDays+" days* were added for the downtime.");
+        txt+=L(_ml,"\n\n⚠️ لینک قدیمی دیگر کار نمی‌کند — لینک جدید را جایگزین کنید.","\n\n⚠️ The old link no longer works — replace it with the new one.");
         migTxt=txt;
       }catch{}
       let links=[];
@@ -8628,14 +8783,19 @@ if(active && active.reachable && active.client && !active.expired && !active.not
               if(_plW && _exp) _stW=_exp-(Number(_plW.days)||0)*86400000;
             }catch{}
           }
-          const _noticeW=userEightyNotice(_used, _total, _exp, _stW, Date.now());
-          if(_noticeW){
-            const _kW=userWarn80Key(uid, _meta.email, _meta.panelId, _total, _exp, _stW);
+          // 🌐 f39: به زبان خودِ کاربر + پیام «تمام شد» هم فرستاده می‌شود
+          const _ulW=await this.userLang(uid);
+          const _qnW=userQuotaNotice(_used, _total, _exp, _stW, Date.now(), _ulW, 0);
+          if(_qnW){
+            const _kW=userWarn80Key(uid, _meta.email, _meta.panelId, _total, _exp, _stW, _qnW.keyKind);
             if(!(await this.store.cache(_kW))){
-              const _okW=await this.tg.msg(uid, _noticeW);
+              const _okW=await this.tg.msg(uid, _qnW.text);
               if(_okW && _okW.ok!==false){
                 await this.store.setCache(_kW,true,400*86400);
-                try{ await this.addLog("user_warn80", "uid="+uid+" email="+_meta.email+" mode="+(_isPrevHit?"preview_button":"button"), uid); }catch{}
+                try{ await this.addLog("user_warn80", "uid="+uid+" email="+_meta.email+" kind="+_qnW.kind+" mode="+(_isPrevHit?"preview_button":"button"), uid); }catch{}
+              } else if(![403,404].includes(Number(_okW&&_okW.error_code)||0)){
+                // 🌐 f40: شکست گذرا (بودجه/شبکه) ⇒ صندوق؛ اجرای بعدی کران می‌فرستد
+                try{ await warn80QueuePush(this.store, {uid, k:_kW, kind:_qnW.kind, text:_qnW.text, src:"button", at:Date.now()}); }catch{}
               }
             }
           }
@@ -9216,8 +9376,10 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     // ukbFor(uid) نه ukb(): اگر روزی silent برداشته شود، دکمهٔ «حالت مدیریت»
     // برای ادمینِ در حالت تست نباید گم شود.
     const say = async (text) => { if(_silent) return; return this.editOrSend(chat,mid,text,await this.ukbFor(uid)); };
+    // 🌐 f41: زبانِ خودِ کاربر — همهٔ پیام‌های این مسیر (ساخت کانفیگ) دوزبانه‌اند.
+    const _ul = await this.userLang(uid);
     const lockOk=await this.store.acquireLock("ucreate:"+uid, 30);
-    if(!lockOk) return say("⏳ درخواست قبلی هنوز در حال انجام است.");
+    if(!lockOk) return say(L(_ul,"⏳ درخواست قبلی هنوز در حال انجام است.","⏳ Your previous request is still being processed."));
     // پنلی که ظرفیتش را رزرو کرده‌ایم؛ در هر مسیر خطا باید آزاد شود.
     // بیرون از try تعریف می‌شود تا در catch/finally هم در دسترس باشد.
     let _reservedPanelId=null;
@@ -9255,7 +9417,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         }
       }
       if(active && active.reachable && active.client && !active.expired){
-        let _why="شما هنوز اشتراک فعال دارید. بعد از اتمام می‌توانید دوباره بگیرید.";
+        let _why=L(_ul,"شما هنوز اشتراک فعال دارید. بعد از اتمام می‌توانید دوباره بگیرید.","You still have an active plan. You can get a new one after it ends.");
         try{
           const _c2=active.client;
           let _t2=getTraffic(_c2);
@@ -9263,8 +9425,11 @@ if(active && active.reachable && active.client && !active.expired && !active.not
           const _u2=(_t2.up||0)+(_t2.down||0), _to2=Number(_t2.total)||0;
           const _e2=tsMs(Number(_c2.expiryTime||0)||0);
           if(_to2>0 && _u2>=_to2 && _e2>Date.now()){
-            _why="📉 حجم این دوره‌تان تمام شده ("+fmtGib(_u2)+" از "+fmtGib(_to2)+" گیگ) — زمانش هنوز باقی است.\n"
-              +"📅 پایان دوره: *"+fmtDateFor(await this.userLang(uid),_e2)+"* — بعد از این تاریخ دوباره «🚀 دریافت کانفیگ رایگان» را بزنید.";
+            _why=L(_ul,
+              "📉 حجم این دوره‌تان تمام شده ("+fmtGib(_u2)+" از "+fmtGib(_to2)+" گیگ) — زمانش هنوز باقی است.\n"
+              +"📅 پایان دوره: *"+fmtDateFor(_ul,_e2)+"* — بعد از این تاریخ دوباره «🚀 دریافت کانفیگ رایگان» را بزنید.",
+              "📉 This period's data is used up ("+fmtGib(_u2)+" of "+fmtGib(_to2)+" GB) — time is still left.\n"
+              +"📅 Period ends: *"+fmtDateFor(_ul,_e2)+"* — tap \"🚀 Get Free Config\" again after that.");
           } else if(_e2>Date.now()){
             _why=L(await this.userLang(uid),"شما هنوز اشتراک فعال دارید.\n📅 پایان دوره: *"+fmtDateFor(await this.userLang(uid),_e2)+"* — بعد از این تاریخ می‌توانید دوباره بگیرید.","You still have an active plan.\n📅 Period ends: *"+fmtDateFor(await this.userLang(uid),_e2)+"* — you can get a new one after that.");
           }
@@ -9273,16 +9438,16 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       }
       const plans=await this.store.getPlans();
       _plan=plans.find(p=>String(p.id)===String(planId));
-      if(!_plan) return say("قالب پیدا نشد. به ادمین بگویید قالب عمومی را چک کند.");
+      if(!_plan) return say(L(_ul,"قالب پیدا نشد. به ادمین بگویید قالب عمومی را چک کند.","Plan not found. Please ask the admin to check the public plan."));
       const planDays=Number(_plan.days)||0;
       if(planDays<=0){
-        return say("این قالب روز اعتبار معتبری ندارد. به ادمین بگویید قالب را اصلاح کند.");
+        return say(L(_ul,"این قالب روز اعتبار معتبری ندارد. به ادمین بگویید قالب را اصلاح کند.","This plan has no valid duration. Please ask the admin to fix it."));
       }
 
       _cfg=await this.store.getPublicCfg();
       const allowPlans=new Set((_cfg.publicPlanIds||[]).map(String));
       if(allowPlans.size && !allowPlans.has(String(planId))){
-        return say("این قالب برای کاربران عمومی فعال نیست.");
+        return say(L(_ul,"این قالب برای کاربران عمومی فعال نیست.","This plan is not enabled for public users."));
       }
 
       // ⚠️ قبلاً به کاربر می‌گفت «پنل عمومی فعال نیست، ادمین تنظیم کند» — نشت اطلاعات داخلی
@@ -9326,7 +9491,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       // بازارسال‌های تلگرام و کلیک‌های تکراری دیگر اسپم نمی‌کنند.
       try{
         if(!(await this.store.cache(_bKey))){
-          await say("⏳ در حال ساخت کانفیگ...");
+          await say(L(_ul,"⏳ در حال ساخت کانفیگ...","⏳ Creating your config..."));
           try{ await this.store.setCache(_bKey, true, 600); }catch{}
         }
       }catch{}
@@ -9563,40 +9728,40 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         let summary;
         if(alreadyExists){
           const keep=[
-            "✅ کانفیگ قبلی شما فعال است (حجم و انقضا تغییر نکرد).",
+            L(_ul,"✅ کانفیگ قبلی شما فعال است (حجم و انقضا تغییر نکرد).","✅ Your previous config is active (data and expiry unchanged)."),
             "📧 "+_email,
           ];
-          if(_bonus>0) keep.push("🎁 هدیه "+fmtBytes(_bonus)+" شما محفوظ ماند و روی کانفیگ بعدی اعمال می‌شود.");
-          else if(_bonusHeld && _rawBonus>0) keep.push("🔒 هدیه "+fmtBytes(_rawBonus)+" ذخیره است (خرج نشد).");
-          keep.push("", "لینک‌ها در پیام بعدی ارسال می‌شود.");
+          if(_bonus>0) keep.push(L(_ul,"🎁 هدیه "+fmtBytes(_bonus)+" شما محفوظ ماند و روی کانفیگ بعدی اعمال می‌شود.","🎁 Your "+fmtBytes(_bonus)+" gift was kept and will be applied to your next config."));
+          else if(_bonusHeld && _rawBonus>0) keep.push(L(_ul,"🔒 هدیه "+fmtBytes(_rawBonus)+" ذخیره است (خرج نشد).","🔒 Your "+fmtBytes(_rawBonus)+" gift is saved (not spent)."));
+          keep.push("", L(_ul,"لینک‌ها در پیام بعدی ارسال می‌شود.","Links will be sent in the next message."));
           summary=keep.join("\n");
         } else {
           const planGB=(Number(_plan.trafficGB)||0);
           const made=[
-            "✅ کانفیگ ساخته شد",
-            "📦 قالب: "+_plan.name,
+            L(_ul,"✅ کانفیگ ساخته شد","✅ Your config was created"),
+            L(_ul,"📦 قالب: ","📦 Plan: ")+_plan.name,
             "📧 "+_email,
           ];
           if(planGB>0 && bonusApplied){
-            made.push("💾 حجم: "+planGB+"GB + 🎁 "+fmtBytes(_bonus)+" هدیه = "+fmtBytes(_totalBytes));
+            made.push(L(_ul,"💾 حجم: ","💾 Data: ")+planGB+"GB + 🎁 "+fmtBytes(_bonus)+L(_ul," هدیه = "," gift = ")+fmtBytes(_totalBytes));
           } else {
-            made.push("💾 حجم: "+(planGB||"∞")+"GB");
+            made.push(L(_ul,"💾 حجم: ","💾 Data: ")+(planGB||"∞")+"GB");
             // اگر هدیه‌ای داشت و عمداً خرج نشد، سکوت نکن — کاربر باید بداند کجاست
             if(planGB>0 && _bonusHeld && _rawBonus>0){
-              made.push("🔒 هدیه "+fmtBytes(_rawBonus)+" ذخیره ماند (طبق انتخاب خودت).");
+              made.push(L(_ul,"🔒 هدیه "+fmtBytes(_rawBonus)+" ذخیره ماند (طبق انتخاب خودت).","🔒 Your "+fmtBytes(_rawBonus)+" gift was kept (your choice)."));
             }
           }
-          made.push("⏰ اعتبار: "+fmtRemain(Math.max(1,Number(_plan.days)||1)*86400000));
+          made.push(L(_ul,"⏰ اعتبار: ","⏰ Validity: ")+fmtRemain(Math.max(1,Number(_plan.days)||1)*86400000,_ul));
           summary=made.join("\n");
         }
         // 📦 همه‌چیز در یک پیام: مشخصات + لینک‌ها + فوتر و دکمه‌ها
         if(links.length){
           const n=await sendConfigLinks(this.tg, chat, links, summary, true);
           if(!n){
-            await this.tg.call("sendMessage",{chat_id:chat, text:summary+"\n\nلینک اتصال هنوز آماده نیست. کمی بعد دوباره از «کانفیگ‌های من» تلاش کنید.", reply_markup: await this.ukbFor(uid), disable_web_page_preview:true});
+            await this.tg.call("sendMessage",{chat_id:chat, text:summary+"\n\n"+L(_ul,"لینک اتصال هنوز آماده نیست. کمی بعد دوباره از «کانفیگ‌های من» تلاش کنید.","The connection link isn't ready yet. Try \"My Configs\" again shortly."), reply_markup: await this.ukbFor(uid), disable_web_page_preview:true});
           }
         } else {
-          await this.tg.call("sendMessage",{chat_id:chat, text:summary+"\n\nلینک اتصال هنوز آماده نیست. کمی بعد دوباره از «کانفیگ‌های من» تلاش کنید.", reply_markup: await this.ukbFor(uid), disable_web_page_preview:true});
+          await this.tg.call("sendMessage",{chat_id:chat, text:summary+"\n\n"+L(_ul,"لینک اتصال هنوز آماده نیست. کمی بعد دوباره از «کانفیگ‌های من» تلاش کنید.","The connection link isn't ready yet. Try \"My Configs\" again shortly."), reply_markup: await this.ukbFor(uid), disable_web_page_preview:true});
         }
         // ساخت موفق بود → کلاینت از این پس در getClients() شمرده می‌شود،
         // پس نگه‌داشتن رزرو یعنی شمارش مضاعف. آزادش کن.
@@ -9609,8 +9774,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         try{ if(_reservedPanelId!=null){ await this._releasePanelReservation(_reservedPanelId, uid); _reservedPanelId=null; } }catch{}
         const msg=e&&e.message?e.message:String(e);
         const soft=/limit exceeded|STORE|KV|D1|storage|subrequest|Too many|سقف/i.test(msg)
-          ? "الان امکان ثبت نیست، چند دقیقه دیگر دوباره تلاش کنید."
-          : ("ساخت انجام نشد. لطفاً دوباره تلاش کنید.");
+          ? L(_ul,"الان امکان ثبت نیست، چند دقیقه دیگر دوباره تلاش کنید.","Registration isn't possible right now — please try again in a few minutes.")
+          : L(_ul,"ساخت انجام نشد. لطفاً دوباره تلاش کنید.","Creation failed. Please try again.");
         try{ await this.store.del(_bKey); }catch{}
         // 🔁 کاربر را در صف بگذار تا کرون (هر ~۵ دقیقه، بی‌صدا) دوباره تلاش کند
         // و به ادمین اطلاع بده — دیگر «بی‌خبر» نمی‌ماند.
@@ -9618,7 +9783,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         try{ await this._notifyAdminsNoPublicPanel(
           "ساخت کانفیگ کاربر "+String(uid)+" ناموفق بود — در صف انتظار قرار گرفت. ("+String(msg).slice(0,120)+")"
         ); }catch{}
-        await say("⏳ "+soft+"\n\n🔁 در صف انتظار قرار گرفتید؛ به محض آماده شدن سرور، کانفیگ ساخته و همین‌جا ارسال می‌شود.");
+        await say(L(_ul,"⏳ ","⏳ ")+soft+L(_ul,"\n\n🔁 در صف انتظار قرار گرفتید؛ به محض آماده شدن سرور، کانفیگ ساخته و همین‌جا ارسال می‌شود.","\n\n🔁 You were added to the waiting queue; as soon as capacity is free, your config will be created and sent right here."));
       }
     } finally {
       // 🔒 تور ایمنی: هر مسیر خروجی (return زودهنگام، throw بین رزرو تا try داخلی،
@@ -9742,11 +9907,16 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     }
     
     if (sentCount > 0) {
-      await this.tg.msg(chat, "✅ پیام شما با موفقیت برای پشتیبانی ارسال شد. به محض پاسخ همینجا مطلع خواهید شد.\n\nمی‌توانید پیام دیگری بفرستید یا روی **❌ اتمام گفتگو** بزنید.", {
-        reply_markup: kb([[btn("❌ اتمام گفتگو", "u:support_cancel")]])
+      // 🌐 f39: این پیام‌ها به «کاربر» می‌روند ⇒ به زبان خودِ کاربر
+      await this.tg.msg(chat, L(lang,
+        "✅ پیام شما با موفقیت برای پشتیبانی ارسال شد. به محض پاسخ همینجا مطلع خواهید شد.\n\nمی‌توانید پیام دیگری بفرستید یا روی **❌ اتمام گفتگو** بزنید.",
+        "✅ Your message was delivered to support. You'll be notified here as soon as they reply.\n\nYou can send another message or tap **❌ End chat**."), {
+        reply_markup: kb([[btn(L(lang,"❌ اتمام گفتگو","❌ End chat"), "u:support_cancel")]])
       });
     } else {
-      await this.tg.msg(chat, "❌ ارسال پیام با خطا مواجه شد. لطفاً دوباره تلاش کنید.");
+      await this.tg.msg(chat, L(lang,
+        "❌ ارسال پیام با خطا مواجه شد. لطفاً دوباره تلاش کنید.",
+        "❌ Sending failed. Please try again."));
     }
   }
 
@@ -9767,10 +9937,11 @@ if(active && active.reachable && active.client && !active.expired && !active.not
    *    اول یکی‌شان کنید.
    */
   async userSupportFlush(chat, mid, uid, from) {
+    const _sl=await this.userLang(uid);   // 🌐 f41: زبان خودِ کاربر
     const state=await this.store.getState(uid);
     const items=(state&&state.data&&state.data.items)||[];
     if(!items.length){
-      await this.editOrSend(chat,mid,"هنوز چیزی در پیش‌نویس نیست. اول پیام/عکس/فیلم بفرستید.", this._supportKb(0));
+      await this.editOrSend(chat,mid,L(_sl,"هنوز چیزی در پیش‌نویس نیست. اول پیام/عکس/فیلم بفرستید.","Nothing in the draft yet. Send a message, photo or video first."), this._supportKb(0));
       return;
     }
     const uname=(from&&from.username)?("@"+from.username):"";
@@ -9793,7 +9964,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       }
     }catch{}
     if(!targets.length){
-      await this.editOrSend(chat,mid,"ادمین تنظیم نشده.", this.ukb());
+      await this.editOrSend(chat,mid,L(_sl,"ادمین تنظیم نشده.","No admin is configured."), this.ukb());
       return;
     }
     for(const adminId of targets){
@@ -9818,24 +9989,26 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     }
     try{ await this.store.clearState(String(uid)); }catch{}
     try{ await this.addLog("user_support", "from="+uid+" items="+items.length, uid); }catch{}
-    await this.editOrSend(chat,mid,"✅ همه پیام‌ها (*"+items.length+"*) به پشتیبانی ارسال شد.", this.ukb());
+    await this.editOrSend(chat,mid,L(_sl,"✅ همه پیام‌ها (*","✅ All messages (*")+items.length+L(_sl,"*) به پشتیبانی ارسال شد.","*) were sent to support."), this.ukb());
   }
 
   async userSupportCancel(chat, mid, uid) {
+    const _xl=await this.userLang(uid);   // 🌐 f41
     try{ await this.store.clearState(String(uid)); }catch{}
     try{
-      if(mid) await this.tg.call("editMessageText",{chat_id:chat, message_id:mid, text:"لغو شد.", reply_markup:{inline_keyboard:[]}});
+      if(mid) await this.tg.call("editMessageText",{chat_id:chat, message_id:mid, text:L(_xl,"لغو شد.","Cancelled."), reply_markup:{inline_keyboard:[]}});
     }catch{}
     await this.tg.call("sendMessage",{
       chat_id:chat,
-      text:"لغو شد. از دکمه‌های پایین استفاده کنید.",
+      text:L(_xl,"لغو شد. از دکمه‌های پایین استفاده کنید.","Cancelled. Use the buttons below."),
       reply_markup: this.ukb()
     });
   }
 
   async userSupportClear(chat, mid, uid) {
     try{ await this.store.setState(String(uid),"user_support",{items:[]}); }catch{}
-    await this.editOrSend(chat,mid,"پیش‌نویس پاک شد. دوباره پیام بفرستید.", this._supportKb(0));
+    await this.editOrSend(chat,mid,L(this._ulang==="en"?"en":"fa",
+      "پیش‌نویس پاک شد. دوباره پیام بفرستید.","Draft cleared. Send your message again."), this._supportKb(0));
   }
 
   async supportReplyMedia(chat, adminUid, msg) {
@@ -10515,13 +10688,15 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const pct=total>0?Math.min(100, Math.round(used/total*100)):0;
     const exp=Number(cl.expiryTime||0)||0;
     const now=Date.now();
-    let timeLine="نامحدود";
+    // 🌐 f41: «نامحدود/منقضی شده» و باقی‌ماندهٔ زمان هم به زبان خودِ کاربر
+    const _langT=await this.userLang(uid);
+    let timeLine=L(_langT,"نامحدود","unlimited");
     if(exp){
       const left=exp-now;
-      if(left<=0) timeLine="منقضی شده";
-      else timeLine=fmtRemain(left);
+      if(left<=0) timeLine=L(_langT,"منقضی شده","expired");
+      else timeLine=fmtRemain(left,_langT);
     }
-    const lang=await this.userLang(uid);
+    const lang=_langT;
     const st = active.expired
       ? L(lang,"🔴 اشتراک منقضی شده","🔴 Subscription expired")
       : L(lang,"🟢 اشتراک فعال","🟢 Subscription active");
@@ -10566,11 +10741,13 @@ if(active && active.reachable && active.client && !active.expired && !active.not
               if(plan&&expN) startTs=expN-(Number(plan.days)||0)*86400000;
             }catch{}
           }
-          const notice=userEightyNotice(used, total, expN, startTs, Date.now());
-          if(notice){
-            const nk=userWarn80Key(uid, meta.email, meta.panelId!=null?meta.panelId:(active.panel&&active.panel.id), total, expN, startTs);
+          // 🌐 f39: زبان خودِ کاربر + پوشش حالت «تمام شد»
+          const _ulS=await this.userLang(uid);
+          const _qnS=userQuotaNotice(used, total, expN, startTs, Date.now(), _ulS, 0);
+          if(_qnS){
+            const nk=userWarn80Key(uid, meta.email, meta.panelId!=null?meta.panelId:(active.panel&&active.panel.id), total, expN, startTs, _qnS.keyKind);
             if(!await this.store.cache(nk)){
-              const ok=await this.tg.msg(uid, notice);
+              const ok=await this.tg.msg(uid, _qnS.text);
               if(ok && ok.ok!==false) await this.store.setCache(nk,true,400*86400);
             }
           }
@@ -11402,15 +11579,19 @@ if(active && active.reachable && active.client && !active.expired && !active.not
                 if(plan) startTs=expN-(Number(plan.days)||0)*86400000;
               }catch{}
             }
-            const notice=userEightyNotice(used, total, expN, startTs, Date.now());
-            if(notice){
-              const nk=userWarn80Key(uid, email, p.id, total, expN, startTs);
+            // 🌐 f39: زبان خودِ کاربر (ادمینِ در حالت تست) + پوشش «تمام شد»
+            const _ulP=await this.userLang(uid);
+            const _qnP=userQuotaNotice(used, total, expN, startTs, Date.now(), _ulP, 0);
+            if(_qnP){
+              const nk=userWarn80Key(uid, email, p.id, total, expN, startTs, _qnP.keyKind);
               if(!await this.store.cache(nk)){
-                const ok=await this.tg.msg(uid, notice);
+                const ok=await this.tg.msg(uid, _qnP.text);
                 if(ok && ok.ok!==false){
                   await this.store.setCache(nk,true,400*86400);
-                  try{ await this.addLog("user_warn80", "uid="+uid+" email="+email+" panel="+p.id+" mode=preview_manual", uid); }catch{}
-                } else {
+                  try{ await this.addLog("user_warn80", "uid="+uid+" email="+email+" panel="+p.id+" kind="+_qnP.kind+" mode=preview_manual", uid); }catch{}
+                } else if(![403,404].includes(Number(ok&&ok.error_code)||0)){
+                  // 🌐 f40: شکست گذرا ⇒ صندوق ارسال
+                  try{ await warn80QueuePush(this.store, {uid, k:nk, kind:_qnP.kind, text:_qnP.text, src:"preview_manual", at:Date.now()}); }catch{}
                   try{ await this.addLog("user_warn80_fail", "uid="+uid+" preview_manual "+String((ok&&ok.description)||"send failed").slice(0,110), uid); }catch{}
                 }
               }
@@ -20662,6 +20843,20 @@ export default {
       const token0=await store.getToken();
       if(token0){
         const bot0=new Bot(store, token0, null);
+        // 🌐 f40: صندوق هشدارها را «اولِ» هر اجرا خالی کن. اینجا بودجهٔ subrequest
+        //    کاملاً تازه است، پس پیام‌ها واقعاً به کاربر می‌رسند (قبلاً ته صف بود و
+        //    با خطای «Too many subrequests» می‌سوخت و کاربر بی‌پیام می‌ماند).
+        try{
+          const _ft=await store.acquireLock("cron:warn80_flush", 45);
+          if(_ft){
+            try{
+              const _fr=await warn80Flush(store, new Tg(token0), W80_FLUSH_MAX);
+              if(_fr && (_fr.sent || _fr.left)) console.log("warn80 flush "+JSON.stringify(_fr));
+            }finally{
+              try{ await store.releaseLock("cron:warn80_flush", _ft); }catch{}
+            }
+          }
+        }catch(e){ console.error("warn80 flush", e&&e.message); }
         // هر کار سنگین کران با قفل توزیع‌شده اجرا می‌شود تا دو اجرای
         // همپوشان (یا دو ایزوله) همزمان سراغ یک عملیات نروند.
         const runLocked = async (name, ttlSec, fn) => {
@@ -21256,7 +21451,12 @@ export default {
         }
         if(!any) panelNoTraffic.add(String(row.p.id));
       }
-      let _fb80=20;   // بودجهٔ fetch تکی مصرف در هر کرون — جلوی ترکیدن سقف subrequest
+      // 🌐 f40: ۲۰ ⇒ ۸. این fetch‌ها هم بخشی از بودجهٔ ۵۰تایی همین اجرا هستند؛
+      //    با ۲۰ تا، خودِ جمع‌آوری هم به سقف می‌خورد و کاندیدها بی‌پیام می‌ماندند.
+      let _fb80=8;   // بودجهٔ fetch تکی مصرف در هر کرون — جلوی ترکیدن سقف subrequest
+      // 🌐 f40: کاندیدهای آمادهٔ ارسال در صندوق جمع می‌شوند (ارسال در اجرای بعد)
+      let _w80Out=await warn80OutboxRead(store);
+      let _w80OutDirty=false;
       // 🔴 d73: کاندیدها اول همه جمع می‌شوند تا اگر بودجهٔ تکی تمام شد، «نقطهٔ شروع»
       //    در دور بعد بچرخد (warn80:fb_cursor) و هیچ کاربری قحطیِ دائمی نشود.
       const _w80List=[];
@@ -21301,7 +21501,9 @@ export default {
             candidates.push({ email:pe, panelId:pp, planId:pi, created:pc, mode:"preview" });
           }
         }
-        for(const meta of candidates){ _w80List.push({id:String(id), meta}); }
+        // 🌐 f39: زبانِ خودِ کاربر همراه کاندید ذخیره می‌شود (نه زبان ادمین)
+        const _wul=((u && u.lang)==="en")?"en":"fa";
+        for(const meta of candidates){ _w80List.push({id:String(id), meta, ul:_wul}); }
       }
       // 🔴 d73: چرخش بودجهٔ تکی — فقط وقتی بودجهٔ همین دور تمام شده باشد کرسر
       //    جلو می‌رود تا دور بعد، کاندیدهایی که جا ماندند اول صف باشند.
@@ -21319,7 +21521,7 @@ export default {
       try{ _w80Start=Number(await store.get("warn80:fb_cursor"))||0; }catch{ _w80Start=0; }
       for(let _w80ri=0; _w80ri<_w80N; _w80ri++){
         const _w80slot=((_w80ri+_w80Start)%_w80N);
-        const {id, meta}=_w80List[_w80slot];
+        const {id, meta, ul:_wul}=_w80List[_w80slot];
         try{
           const em=String(meta.email||"").toLowerCase();
           const pid=String(meta.panelId==null?"":meta.panelId);
@@ -21390,44 +21592,32 @@ export default {
           }
           const startTs=warn80StartTs(meta.created, cl, planDays, exp);
           // 🐛 fix: کش درصدِ این کاندید برای اولویت‌بندی دور بعد
+          const _k80=_w80ck({id, meta});
+          const _hiPrev=Number(_w80pcts[_k80])||0;   // 🌊 f39: بیشینهٔ درصد دیده‌شده (high-water)
           {
-            const _st80=userWarn80State(used, total, exp, startTs, now2);
-            const _k80=_w80ck({id, meta});
-            // 🔴 f3: درصدِ «خام» هر کاندید هر دور ثبت/به‌روز می‌شود. نسخهٔ قبلی فقط
-            //    ≥۸۰٪ را کش می‌کرد و زیر آستانه را حذف می‌کرد — یعنی «اولویت
-            //    نزدیک‌ها به مرز» عملاً هیچ‌وقت شکل نمی‌گرفت و کش بی‌فایده بود.
             const _rp80=userWarn80RawPcts(used, total, exp, startTs, now2);
             const _p80=Math.max(_rp80.volPct, _rp80.timePct);
-            if(_w80pcts[_k80]!==_p80){ _w80pcts[_k80]=_p80; _w80pctsDirty=true; }
+            // 🔴 f3 + 🌊 f39: این کش هم «اولویت نزدیک‌ها به مرز» است و هم
+            //    «بیشینهٔ دیده‌شده» — پس هرگز پایین نمی‌آید تا هشدار دیرهنگام
+            //    وقتی دادهٔ پنل ریست شد/کران جا افتاد، از دست نرود.
+            if(_p80>_hiPrev){ _w80pcts[_k80]=_p80; _w80pctsDirty=true; }
           }
-          const notice=userEightyNotice(used, total, exp, startTs, now2);
-          if(!notice) continue;
-          const k=userWarn80Key(id, em, pid, total, exp, startTs);
+          const _qn=userQuotaNotice(used, total, exp, startTs, now2, _wul, _hiPrev);
+          if(!_qn) continue;
+          const notice=_qn.text;
+          const k=userWarn80Key(id, em, pid, total, exp, startTs, _qn.keyKind);
           if(await store.cache(k)) continue;
           // ارسال ناموفق قبلی (مثلاً بلاک) قبلاً هر ۵ دقیقه لاگ اسپم می‌کرد؛ ۲۴ ساعت صبر کن
           try{ if(await store.cache(k+":fail")) continue; }catch{}
           // 🔴 d73: خطای throwشدهٔ tg.msg قبلاً کل دورِ کرون را می‌انداخت (بلع بی‌صدا
           //    در catch بیرونی) و کاربر هیچ‌وقت هشدار نمی‌گرفت. حالا خودمان می‌گیریم.
-          let ok=null;
-          try{ ok=await tg.msg(id, notice); }
-          catch(_se80){ ok={ok:false, description:String((_se80&&_se80.message)||_se80).slice(0,110)}; }
-          if(!ok || ok.ok===false){
-            // 🔴 d73: شکست گذرا (سقف subrequest/شبکه/429) فقط ۱۰ دقیقه سکوت تا دور
-            //    بعد دوباره تلاش شود؛ فقط ردّ دائمی تلگرام (403 بلاک / 404 چت ناموجود)
-            //    ۲۴ ساعت سکوت می‌کند. لاگِ شکست هم rate-limit شده (یک‌بار per TTL).
-            const _ec80=Number(ok&&ok.error_code)||0;
-            const _perm80=(_ec80===403||_ec80===404);
-            try{ await store.setCache(k+":fail", true, _perm80?86400:600); }catch{}
-            try{
-              if(!(await store.cache(k+":faillog"))){
-                await store.setCache(k+":faillog", true, _perm80?86400:3600);
-                await store.pushLog({action:"user_warn80_fail", detail:"uid="+id+" "+meta.mode+" "+String((ok&&ok.description)||"send failed").slice(0,110), by:"cron", meta:null});
-              }
-            }catch{}
-            continue;
+          // 🌐 f40: ارسال مستقیم حذف شد — به صندوق می‌رود و در ابتدای اجرای بعدِ
+          //    کران (با بودجهٔ تازه) فرستاده می‌شود. دلیل: این بلوک ته زنجیرهٔ کران
+          //    است و سقف subrequest همان‌جا تمام می‌شد ⇒ هشدار هیچ‌وقت نمی‌رسید.
+          if(_w80Out.length < W80_OUTBOX_CAP && !_w80Out.some(x=>x.k===k)){
+            _w80Out.push({uid:id, k, kind:_qn.kind, text:notice, src:"cron", mode:meta.mode, at:now2});
+            _w80OutDirty=true;
           }
-          await store.setCache(k,true,400*86400);
-          try{ await store.pushLog({action:"user_warn80", detail:"uid="+id+" email="+em+" panel="+pid+" mode="+meta.mode, by:"cron", meta:null}); }catch{}
         }catch(_we80){
           // 🔴 d73: خطای یک کاندید (fetch پنل/KV/…) نباید بقیهٔ کاندیدهای همین دور
           //    را بیندازد — قبلاً یک throw وسط حلقه، همهٔ کاربرانِ بعد از خود را
@@ -21442,8 +21632,9 @@ export default {
       }
       // 🔴 d73: نوشتن کرسر «بعد از» حلقه — بودجه همان‌جا داخل حلقه مصرف می‌شود؛
       //    اگر تا آخر حلقه بودجه تمام شده بود، دور بعد از جای اتمام شروع می‌کند.
+      if(_w80OutDirty){ try{ await warn80OutboxWrite(store, _w80Out); }catch{} }
       if(_w80N>0 && _fb80<=0){
-        try{ await store.put("warn80:fb_cursor", String((_w80Start+(20-_fb80))%_w80N)); }catch{}
+        try{ await store.put("warn80:fb_cursor", String((_w80Start+(8-_fb80))%_w80N)); }catch{}
       }
       // 🐛 fix: ذخیرهٔ کش درصد فقط اگر چیزی عوض شده (صرفه‌جویی در write) +
       // حذف کلیدهای یتیم کاربرانی که دیگر کاندید نیستند
