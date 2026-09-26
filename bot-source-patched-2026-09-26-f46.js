@@ -17455,11 +17455,17 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
 
   async onAddUrlV2(chat,uid,text) {
+    const lang=await this.lang();
     const state=await this.store.getState(uid);
     const token=(state&&state.data&&state.data.token)||"";
     const url=normalizePanelUrl(text);
     if(!url){
       return this.tg.msg(chat,"❌ "+L(lang,"آدرس نامعتبر است. دوباره بفرست (https://host/path).","Invalid URL — send again (https://host/path)."));
+    }
+    if(!token){
+      // آدرس را نگه می‌داریم تا قدمِ بعدیِ توکن همان را تکمیل کند
+      await this.store.setState(uid,"add2_token",{url});
+      return this.tg.msg(chat,L(lang,"🔑 توکنِ این پنل را بفرست (مثل `user:pass`):","🔑 Send this panel's token (e.g. `user:pass`):"));
     }
     return this._showAddPreview(chat,uid,url,token,false);
   }
@@ -17471,6 +17477,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const d=this._addDefaults(panels);
     // keep = پیش‌نویسِ ویرایش‌شده (نام/مهلت/حجم/دسته) — وگرنه پیش‌فرض‌ها
     const base=(keep && typeof keep==="object")?keep:d;
+    const cardMid=Number(base._mid)||0;      // شناسهٔ همان کارتِ قبلی (تا هر ویرایش پیام تازه نسازد)
     const draft={
       url: url||base.url,
       token: token||base.token,
@@ -17479,6 +17486,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       cat: base.cat||d.cat,
       gb: (base.gb!=null)?base.gb:d.gb,
       autoUrl: !!autoUrl,
+      _mid: cardMid,
     };
     await this.store.setState(uid,"add2_confirm",draft);
     const tokenShown=String(token).length>16?String(token).slice(0,8)+"…":String(token);
@@ -17496,12 +17504,21 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       L(lang,"اگر درست است «✅ تأیید و ساخت» را بزن؛ هر خط را هم می‌توانی جدا عوض کنی.",
               "Tap “✅ Create” if it's right; each line can be edited separately."),
     ];
-    await this.tg.msg(chat, lines.join("\n"), {reply_markup:kb([
+    // ⚠️ editOrSend چهارمین آرگومانش *خودِ* markup است، ولی tg.msg آن را داخل
+    //    {reply_markup:…} می‌خواهد؛ پس هر کدام شکلِ خودش را می‌گیرد.
+    const kbObj=kb([
       [btn(L(lang,"✅ تأیید و ساخت","✅ Create"),"addc:ok")],
       [btn("✏️ "+L(lang,"نام","Name"),"addc:name"), btn("⏱ "+L(lang,"مهلت","Days"),"addc:days")],
       [btn("📊 "+L(lang,"حجم","Volume"),"addc:gb"), btn("📂 "+L(lang,"دسته","Category"),"addc:cat")],
       [btn(L(lang,"❌ لغو","❌ Cancel"),"m:panels")],
-    ])});
+    ]);
+    const text=lines.join("\n");
+    // ویرایش‌ها همان کارت را بازنویسی می‌کنند (پیامِ تازه فقط بارِ اول)
+    if(cardMid) return this.editOrSend(chat, cardMid, text, kbObj);
+    const sent=await this.tg.msg(chat, text, {reply_markup:kbObj});
+    const nmid=(sent&&sent.ok&&sent.result)?sent.result.message_id:0;
+    if(nmid) await this.store.setState(uid,"add2_confirm",Object.assign({},draft,{_mid:nmid}));
+    return sent;
   }
 
   /** ویرایشِ خطِ نام. */
@@ -17530,7 +17547,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const st=await this.store.getState(uid);
     const d=Object.assign({},(st&&st.data)||{});
     const name=String(text||"").trim();
-    if(!name) return this.tg.msg(chat,"❌ Empty name.");
+    if(!name) return this.tg.msg(chat,"❌ "+L(lang,"نام خالی است.","Empty name."));
     d.name=name.slice(0,40);
     await this.store.setState(uid,"add2_confirm",d);
     return this._showAddPreview(chat,uid,d.url,d.token,d.autoUrl,d);
@@ -17593,7 +17610,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       });
       await this.store.savePanels(panels);
     });
-    if(newId==null){ return this.tg.msg(chat,"❌ Panel create failed."); }
+    if(newId==null){ return this.tg.msg(chat,"❌ "+L(lang,"ساختِ پنل نشد؛ دوباره تلاش کن.","Panel create failed; try again.")); }
     await this.store.clearState(uid);
     let catMsg="";
     try{ await this._setPanelPublic(newId, d.cat==="public"); catMsg=(d.cat==="public")?L(lang,"🌐 عمومی","🌐 Public"):L(lang,"🖥 عادی","🖥 Normal"); }catch(e){}
