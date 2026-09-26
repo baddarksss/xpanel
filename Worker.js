@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-26-f46";
+const CODE_STAMP = "2026-09-26-f47";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -2325,6 +2325,11 @@ function parsePanelInput(text){
   }
   return {url:"", token:raw.replace(/^token\s*[:=]\s*/i,"").trim()};
 }
+/** 🔑 f47: شکلِ «توکنِ پنل» (۳x-ui → تنظیمات → امنیت → API Token).
+ *  رشتهٔ ۴۴ تا ۶۴ کاراکتری از A-Za-z0-9-‌_ بدونِ فاصله. با همین، ربات می‌فهمد
+ *  کاربر «توکن» را فرستاده و خودش جریانِ افزودنِ پنل را شروع می‌کند. */
+const PANEL_TOKEN_RE = /^[A-Za-z0-9_-]{44,64}$/;
+function isPanelToken(x) { return PANEL_TOKEN_RE.test(String(x||"").trim()); }
 /** متن وضعیت، دوزبانه */
 function clientStatusText(c, lang) {
   const st = clientStatus(c, lang);
@@ -6349,7 +6354,12 @@ class Bot {
       // if in support flow, already handled in onMessage
       return;
     }
-    if(!state) return;
+    // 🔑 f47 (خواستهٔ کاربر): اگر فقط «توکنِ پنل» را بفرستد، خودِ ربات جریانِ
+    //    افزودنِ پنل را شروع می‌کند — بدونِ نیاز به هیچ دستور یا دکمه‌ای.
+    if(!state){
+      try{ if(await this.autoAddPanelByToken(chat, uid, text, msg.message_id)) return; }catch(_e){}
+      return;
+    }
     try {
       switch(state.flow) {
         case "add_name": return this.onAddPanelName(chat,uid,text);
@@ -17398,9 +17408,48 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const lang=await this.lang();
     await this.store.setState(uid,"add2_token",{});
     await this.editOrSend(chat,mid,
-      L(lang,"➕ *افزودن پنل*\n\n🔑 *توکن پنل* را بفرست (مثل `user:pass`).\nآدرس را خودم پیدا می‌کنم؛ اگر پیدا نشد از خودت می‌پرسم.\n\n_می‌توانی آدرس و توکن را با هم هم بفرستی؛ مثلاً:_\n`https://host/path user:pass`",
-              "➕ *Add panel*\n\n🔑 Send the *panel token* (e.g. `user:pass`).\nI'll find the URL myself; if not, I'll ask.\n\n_You can also send both:_\n`https://host/path user:pass`"),
+      L(lang,"➕ *افزودن پنل*\n\n🔑 *توکن پنل* را بفرست (تنظیمات → امنیت → API Token)، یا `user:pass`.\nآدرس را خودم پیدا می‌کنم؛ اگر پیدا نشد از خودت می‌پرسم.\n\n_می‌توانی آدرس و توکن را با هم بفرستی؛ مثلاً:_\n`https://host/managepanel TOKEN`\n\n💡 *لازم نیست این دکمه را بزنی:* هر وقت توکن را در چت بفرستی، خودم جریان را شروع می‌کنم.",
+              "➕ *Add panel*\n\n🔑 Send the *panel token* (Settings → Security → API Token), or `user:pass`.\nI'll find the URL myself; if not, I'll ask.\n\n_You can also send both:_\n`https://host/managepanel TOKEN`\n\n💡 *No need to press this button:* send the token any time and I'll start."),
       (await this.backPanels()));
+  }
+
+  /* ─────────────── 🔑 f47: افزودنِ پنل با فرستادنِ توکن (بدونِ منو) ───────────────
+   *  کاربر: «توکن پنل این شکلیه … اینو بدم ربات خودش فرایند اضافه کردن پنل شروع کنه»
+   *  پس هر پیامِ «توکنِ تنها» یا «آدرس + توکن» که ادمین بفرستد، جریانِ افزودنِ
+   *  پنل را از همان‌جا شروع می‌کند: آدرس خودکار پیدا می‌شود، کارتِ پیش‌فرض‌ها
+   *  (x<بعدی> / ۳۰ روز / عمومی / ۷۵GB) می‌آید و با «✅ تأیید و ساخت» تمام می‌شود.
+   */
+  async autoAddPanelByToken(chat, uid, text, mid) {
+    const raw=String(text||"").trim();
+    if(!raw || raw.length>300) return false;
+    const parts=raw.split(/\s+/).filter(Boolean);
+    let tok="";
+    if(parts.length===1 && isPanelToken(parts[0])) tok=parts[0];
+    else if(parts.length===2 && isPanelToken(parts[1]) && /^https?:\/\//i.test(parts[0])) tok=parts[1];
+    if(!tok) return false;
+    try{ if(!(await this.isOwner(uid))) return false; }catch(_e){ return false; }
+    // اگر همین توکن از قبل روی پنلی ثبت است، دوباره اضافه نکن
+    try{
+      for(const p of ((await this.store.getPanels())||[])){
+        if(String((p&&p.token)||"").trim()===tok){
+          const lg=await this.lang();
+          await this.tg.msg(chat, L(lg,"ℹ️ این توکن از قبل روی پنلِ *","ℹ️ This token is already saved on panel *")
+                                  + esc(p.name||"-") + L(lg,"* ثبت شده است.","*."));
+          await this._tryDeleteMsg(chat, mid);
+          return true;
+        }
+      }
+    }catch(_e){}
+    await this.onAddTokenV2(chat, uid, raw);   // parsePanelInput خودش آدرس/توکن را جدا می‌کند
+    await this._tryDeleteMsg(chat, mid);       // پیامِ حاویِ توکن در چت نماند
+    return true;
+  }
+
+  /** پیامِ حاویِ راز (توکن) را از چت پاک می‌کند — بی‌صدا اگر نشد. */
+  async _tryDeleteMsg(chat, mid) {
+    const id=Number(mid)||0;
+    if(!id) return;
+    try{ await this.tg.call("deleteMessage",{chat_id:chat, message_id:id}); }catch(_e){}
   }
 
   /** آدرسِ پنل را از روی توکن بین آدرس‌هایِ شناخته‌شده پیدا می‌کند. */
@@ -17448,8 +17497,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     if(!url){
       await this.store.setState(uid,"add2_url",{token});
       return this.tg.msg(chat,
-        L(lang,"🌐 آدرسی که این توکن روی آن کار کند پیدا نکردم.\nآدرس را بفرست (مثل `https://host/path`):",
-                "🌐 I couldn't find a URL this token works on.\nSend it (e.g. `https://host/path`):"));
+        L(lang,"🌐 آدرسی که این توکن روی آن کار کند پیدا نکردم.\nآدرس را بفرست — مثل `https://host/managepanel` یا `https://host:2053`:",
+                "🌐 I couldn't find a URL this token works on.\nSend it — e.g. `https://host/managepanel` or `https://host:2053`:"));
     }
     return this._showAddPreview(chat,uid,url,token,auto);
   }
