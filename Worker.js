@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-26-f48";
+const CODE_STAMP = "2026-09-26-f49";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -1544,6 +1544,32 @@ function isQuotaErr(x){
   return /daily row write limit|row write limit|exceeded D1/i.test(m);
 }
 /**
+ * f49: شکنندهٔ طوفانِ بازارسال.
+ *   شاهدِ واقعی (۲۶ سپتامبر): ۱۷:۰۰Z = ۷٬۷۲۲ اجرا ⇒ ۱۸:۰۰Z = ۱۹٬۴۸۵ اجرا و
+ *   ۳۶٬۰۴۳ ردیفِ نوشتن در یک ساعت. وقتی ذخیره‌سازی خطا داد، وب‌هوک ۵۰۳ می‌داد
+ *   و تلگرام همان آپدیت‌ها را بی‌وقفه بازارسال می‌کرد؛ هر بازارسال خودش یک
+ *   تلاشِ نوشتنِ تازه بود ⇒ حلقهٔ مرگ و سوختنِ سهمیه.
+ *   حالا: ≥۱۵ خطای ذخیره‌سازی در یک دقیقه (در همین ایزوله) ⇒ ۶۰ ثانیه پاسخِ
+ *   سریعِ ۲۰۰ بدونِ هیچ تماسِ ذخیره‌سازی. آپدیت‌های همان ۶۰ ثانیه پردازش
+ *   نمی‌شوند (بهتر از فلج‌شدنِ کاملِ ربات) و در لاگ هم اعلام می‌شود.
+ *   ⚠️ عمداً در حافظهٔ ایزوله است — هیچ نوشتنی برای خودِ شکننده نداریم.
+ */
+function noteClaimError(){
+  const now=Date.now();
+  const st=globalThis.__claimErr||(globalThis.__claimErr={n:0,at:now,until:0});
+  if(now-(st.at||0)>60000){ st.n=0; st.at=now; }
+  st.n++;
+  if(st.n>=15 && !(st.until>now)){
+    st.until=now+60000;
+    console.error("⚠️ f49 storm breaker OPEN (60s) after "+st.n+" storage errors in a minute");
+    st.n=0; st.at=now;
+  }
+}
+function stormBreakerOpen(){
+  const st=globalThis.__claimErr;
+  return !!(st && st.until && Date.now()<st.until);
+}
+/**
  * f48: خبرِ یک‌بارهٔ پر شدنِ سهمیهٔ نوشتن.
  * ⚠️ عمداً هیچ نوشتنی در D1 ندارد (وگرنه خودش خطا می‌داد) — فقط حافظهٔ ایزوله.
  */
@@ -2646,7 +2672,11 @@ class Store {
       const row = await this.db.prepare("SELECT value, expires_at FROM store WHERE key=?").bind(k).first();
       if(!row) return null;
       if(row.expires_at!=null && Number(row.expires_at)>0 && Date.now()>Number(row.expires_at)){
-        try{ await this.db.prepare("DELETE FROM store WHERE key=?").bind(k).run(); }catch{}
+        // 🔴 f49 (مصرفِ سهمیه): اینجا قبلاً یک DELETE هم زده می‌شد. هر «حذف»
+        //    خودش یک *ردیفِ نوشته‌شده* حساب می‌شود؛ با کرونِ هر دقیقه فقط
+        //    بابتِ کلیدهای کشِ cron، روزی چند صد نوشتنِ بی‌فایده می‌ساخت.
+        //    ردیفِ منقضی حالا سرِ جایش می‌ماند و «وجود ندارد» فرض می‌شود؛
+        //    پاک‌سازیِ انبوه بعداً با یک دستورِ محدود انجام می‌شود (نه در مسیرِ داغ).
         return null;
       }
       return row.value;
@@ -23463,6 +23493,12 @@ export default {
               return new Response("OK",{status:200});
             }
             globalThis.__updSeen.set(uidKey, Date.now()); // بهینه‌سازی؛ منبع حقیقت = claim
+            // f49: اگر ذخیره‌سازی همین حالا در حالِ خطا دادن است، اصلاً D1 را
+            //   امتحان نکن — پاسخِ سریع بده تا بازارسالِ انبوه ساخته نشود.
+            if(stormBreakerOpen()){
+              try{ globalThis.__updSeen.delete(uidKey); }catch{}
+              return new Response("OK",{status:200});
+            }
             const _cl=await store.claimUpdate(update.update_id, 600);
             const _cs=_cl&&_cl.s;
             if(_cs==="seen") return new Response("OK",{status:200});
@@ -23480,6 +23516,7 @@ export default {
               //    پاک شود وگرنه retry تلگرام به همین ایزوله می‌رسد، میان‌بر
               //    __updSeen می‌گیرد، ۲۰۰ می‌بیند و آپدیت برای همیشه گم می‌شود.
               try{ globalThis.__updSeen.delete(uidKey); }catch{}
+              noteClaimError();                       // f49: شمارشِ خطا برای شکننده
               console.error("update claim failed → 503");
               return new Response("Temporarily unavailable",{status:503});
             }
@@ -23491,6 +23528,7 @@ export default {
           //    ادامه‌دادن یعنی پردازشِ بدون claim ⇒ بازارسال تلگرام دوباره
           //    اجرایش می‌کند (آپدیت‌ها idempotent نیستند). پس: پاک‌کردن
           //    نشانگر حافظه + 503 تا تلگرام بعداً دوباره با claim سالم بفرستد.
+          noteClaimError();                           // f49: شمارشِ خطا برای شکننده
           console.error("claim block → 503", e&&e.message);
           try{ if(update && update.update_id!=null && globalThis.__updSeen) globalThis.__updSeen.delete("u"+String(update.update_id)); }catch{}
           return new Response("Temporarily unavailable",{status:503});
