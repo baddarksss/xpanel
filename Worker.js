@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-25-f45";
+const CODE_STAMP = "2026-09-26-f46";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -1958,6 +1958,9 @@ function dynPanels(lang, isOwner) {
   rows.push([btn(labels.testall,"m:testall")]);
   if(isOwner){
     rows.push([btn(labels.sync,"tool:sync_stats"), btn(labels.backup,"m:backup")]);
+    // f46 (خواستهٔ کاربر): مدیریتِ پنل‌های عمومی از بخشِ «عمومی» آمد اینجا
+    rows.push([btn(fa?"🌐 پنل‌های عمومی (دسته و حجم)":"🌐 Public panels", "pm:pubpanels")]);
+    rows.push([btn(fa?"📊 حجمِ هر پنل":"📊 Per-panel volume", "pm:volpick")]);
     rows.push([btn(labels.lim,"pm:trafficlim"), btn(labels.autonotif,"pm:autonotif")]);
     rows.push([btn(fa?"🚚 انتقال کاربران":"🚚 Move users","pm:xfer")]);
   }
@@ -2274,6 +2277,53 @@ function clientStatus(c, lang) {
   if (expired)  return { emoji: "⏰", key: "expired",  exhausted, expired };
   if (exhausted) return { emoji: "📉", key: "exhausted", exhausted, expired };
   return { emoji: "🟢", key: "active", exhausted, expired };
+}
+
+/* ───────────────────────── 🔎 f46: کمک‌تابع‌های جست‌وجو ───────────────────────── */
+
+/** کاربرِ *منقضی*: مهلتش تمام شده. خواستهٔ کاربر: از جست‌وجو کلاً حذف شود
+ *  (چون طرف خودش دوباره کانفیگ می‌گیرد و دیدنش هیچ فایده‌ای ندارد). */
+function clientIsExpired(c){
+  const e=Number((c&&c.expiryTime)||0)||0;
+  return e>0 && e<Date.now();
+}
+/** نامِ خودکارِ پنلِ بعدی: آخرین پنل x35 بود ⇒ بعدی x36 */
+function nextPanelName(panels){
+  let mx=0;
+  for(const p of (panels||[])){
+    const m=String((p&&p.name)||"").trim().match(/^x\s*(\d+)$/i);
+    if(m) mx=Math.max(mx, parseInt(m[1],10)||0);
+  }
+  return "x"+(mx+1);
+}
+/** آدرسِ پنل را یکدست می‌کند (پروتکل + حذفِ اسلشِ آخر، مسیر حفظ می‌شود). */
+function normalizePanelUrl(raw){
+  let u=String(raw||"").trim().replace(/^["'<]+|["'>]+$/g,"");
+  if(!u) return "";
+  if(!/^https?:\/\//i.test(u)) u="https://"+u.replace(/^\/+/,"");
+  try{
+    const x=new URL(u);
+    if(!x.hostname || x.hostname.indexOf(".")<0) return "";
+    const path=(x.pathname&&x.pathname!=="/")?x.pathname.replace(/\/+$/,""):"";
+    return x.origin+path;
+  }catch(e){ return ""; }
+}
+/** از متنِ فرستاده‌شده «آدرس» و «توکن» را جدا می‌کند (هر ترتیبی). */
+function parsePanelInput(text){
+  const raw=String(text||"").trim();
+  if(!raw) return {url:"",token:""};
+  const m=raw.match(/https?:\/\/[^\s"'<>,|]+/i);
+  if(m){
+    const url=normalizePanelUrl(m[0]);
+    const rest=raw.replace(m[0]," ").replace(/[|,]+/g," ").trim();
+    return {url:url, token:(rest.split(/\s+/).filter(Boolean)[0]||"")};
+  }
+  // «host/path user:pass» بدون پروتکل
+  const parts=raw.split(/[\s|,]+/).filter(Boolean);
+  if(parts.length>1 && /^[\w.\-]+\.[a-z]{2,}(\/.*)?$/i.test(parts[0])){
+    return {url:normalizePanelUrl(parts[0]), token:parts.slice(1).join(" ")};
+  }
+  return {url:"", token:raw.replace(/^token\s*[:=]\s*/i,"").trim()};
 }
 /** متن وضعیت، دوزبانه */
 function clientStatusText(c, lang) {
@@ -6097,6 +6147,14 @@ class Bot {
     if(d==="pm:notif_days") return this.startPanelNotifDays(chat,mid);
     if(d==="pm:notif_gb") return this.startPanelNotifGb(chat,mid);
     if(d==="pm:trafficlim") return this.startPanelTrafficLimit(chat,mid);
+    if(d==="pm:pubpanels") return this.pubPanels(chat,mid);
+    if(d==="addc:ok") return this.onAddConfirm(chat,mid,uid);
+    if(d==="addc:name") return this.addEditName(chat,mid,uid);
+    if(d==="addc:days") return this.addEditDays(chat,mid,uid);
+    if(d==="addc:gb") return this.addEditGb(chat,mid,uid);
+    if(d==="addc:cat") return this.addToggleCat(chat,mid,uid);
+    if(d==="pm:volpick") return this.pmVolumePick(chat,mid);
+    if(d.startsWith("pm:vol:")) return this.startPanelVolume(chat,mid,d.substring(7));
     if(d==="pm:xfer") return this.xferStart(chat,mid);
     if(d.startsWith("xfer:from:")) return this.xferPickDest(chat,mid,d.substring(10));
     if(d.startsWith("xfer:to:")) return this.xferAskMode(chat,mid,d.substring(8));
@@ -6292,6 +6350,13 @@ class Bot {
     try {
       switch(state.flow) {
         case "add_name": return this.onAddPanelName(chat,uid,text);
+        // ➕ f46: جریانِ تازهٔ افزودنِ پنل (توکن‌محور)
+        case "add2_token": return this.onAddTokenV2(chat,uid,text);
+        case "add2_url": return this.onAddUrlV2(chat,uid,text);
+        case "add2_name": return this.onAddName2(chat,uid,text);
+        case "add2_days": return this.onAddDays2(chat,uid,text);
+        case "add2_gb": return this.onAddGb2(chat,uid,text);
+        case "pm_vol_gb": return this.onPanelVolumeGb(chat,uid,text);
         case "add_url": return this.onAddPanelUrl(chat,uid,text);
         case "add_token": return this.onAddPanelToken(chat,uid,text);
         case "add_expiry": return this.onAddPanelExpiry(chat,uid,text);
@@ -7294,7 +7359,7 @@ class Bot {
     // --- تنظیمات عمومی (بدون شناسهٔ کانال/متن‌های طولانی) ---
     let cfg={};
     try{ cfg = await this.store.getPublicCfg(); }catch{}
-    const limitGB = Number(cfg.publicPanelLimitGB)>0 ? Number(cfg.publicPanelLimitGB) : 90;
+    const limitGB = Number(cfg.publicPanelLimitGB)>0 ? Number(cfg.publicPanelLimitGB) : 75;
     out.publicConfig = {
       panelLimitGB: limitGB,
       publicPanelIds: (cfg.publicPanelIds||[]).map(String),
@@ -7376,7 +7441,7 @@ class Bot {
         } else {
           row.reachable=true;
           row.capacity={
-            limitGB,
+            limitGB: (Number(p.publicLimitGB)>0? Number(p.publicLimitGB): limitGB),
             spentGB:      +( (chk.used||0)      /1073741824).toFixed(2),
             openCommitGB: +( (chk.openCommit||0)/1073741824).toFixed(2),
             reservedGB:   +( (chk.reserved||0)  /1073741824).toFixed(2),
@@ -7926,8 +7991,13 @@ class Bot {
 
   async _publicPanelCanAccept(panel, planBytes, planDays) {
     const cfg=await this.store.getPublicCfg();
-    const limitGB=Number(cfg.publicPanelLimitGB);
-    const lim=Number.isFinite(limitGB)&&limitGB>0?limitGB:90;
+    // 📊 f46 (خواستهٔ کاربر): حجمِ قابل فروشِ هر پنل می‌تواند جدا باشد (panel.publicLimitGB).
+    //    ترتیب: مقدارِ خودِ پنل → سقفِ کلیِ بخشِ عمومی → پیش‌فرضِ ۷۵ گیگ.
+    const perPanelGB=Number(panel && panel.publicLimitGB);
+    const globalGB=Number(cfg.publicPanelLimitGB);
+    const limitGB=(Number.isFinite(perPanelGB)&&perPanelGB>0) ? perPanelGB
+                 : ((Number.isFinite(globalGB)&&globalGB>0) ? globalGB : 75);
+    const lim=limitGB;
     const limitBytes=lim*1073741824;
 
     // پنلی که ۵ دقیقهٔ اخیر جواب نداده — بدون شبکه رد شو
@@ -11069,7 +11139,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       [btn(L(lang,`⏰ در حال انقضا ≤ ${expLow} روز`,`⏰ Expiring ≤ ${expLow} days`),"pub_adv:exp_low"), btn(L(lang,`⏰ در حال انقضا ≤ ${expHigh} روز`,`⏰ Expiring ≤ ${expHigh} days`),"pub_adv:exp_high")],
       [btn(L(lang,`📉 ترافیک ≤ ${trLow} گیگ`,`📉 Traffic ≤ ${trLow} GB`),"pub_adv:tr_low"), btn(L(lang,`📉 ترافیک ≤ ${trHigh} گیگ`,`📉 Traffic ≤ ${trHigh} GB`),"pub_adv:tr_high")],
       [btn(L(lang,"🔴 کاربران غیرفعال","🔴 Disabled users"),"pub_adv:dis"), btn(L(lang,"🟢 کاربران فعال","🟢 Enabled users"),"pub_adv:en")],
-      [btn(L(lang,"💀 منقضی شده","💀 Expired"),"pub_adv:expired")],
+      /* f46: فیلترِ «💀 منقضی شده» حذف شد — کاربرِ منقضی از جست‌وجو بیرون است */,
       [btn(L(lang,"◀ بازگشت به ربات عمومی","◀ Back to Public Bot"), "m:public")]
     ];
     
@@ -11091,6 +11161,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       try{clients=await api.getClients();}catch{}
       for(const c of clients){
         // ربات (u…) و دستی (مثل ۲۲) روی پنل عمومی
+        if(clientIsExpired(c)) continue;            // 🔎 f46: منقضی‌ها کلاً حذف
         if(!publicClientMatchesQuery(c, users, qNorm)) continue;
         const key=String(p.id)+":"+String(c.email||"").toLowerCase();
         if(seen.has(key)) continue;
@@ -11145,14 +11216,20 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         const exp=c.expiryTime||0;
         const daysLeft=exp?Math.ceil((exp-now)/86400000):9999;
 
+        // 🔎 f46 (خواستهٔ کاربر): کاربرِ منقضی در *هیچ* فیلتری نمی‌آید — کلاً حذف شده.
+        if(clientIsExpired(c)) continue;
         let ok=false;
         if(filter==="exp_low") ok=exp>0&&daysLeft>=0&&daysLeft<=expLow;
         else if(filter==="exp_high") ok=exp>0&&daysLeft>=0&&daysLeft<=expHigh;
         else if(filter==="tr_low") ok=tr.total>0&&rem<=trLow0*1073741824&&rem>=0;
         else if(filter==="tr_high") ok=tr.total>0&&rem<=trHigh0*1073741824&&rem>=0;
-        else if(filter==="dis") ok=c.enable===false; // d43: سازگار با clientStatus/اسنپ‌شات
+        /* 🔎 f46 (خواستهٔ کاربر): «غیرفعال» = فقط کاربرِ واقعاً خاموش. منقضی‌ها
+           چند خط بالاتر کلاً حذف می‌شوند، پس دیگر داخلِ این لیست قاطی نمی‌شوند
+           (شکایتِ کاربر دقیقاً همین بود). کاربرِ خاموشی که حجم/زمان دارد هم
+           می‌ماند، چون می‌خواهی ببینی‌اش و دوباره روشنش کنی. */
+        else if(filter==="dis") ok=c.enable===false;
         else if(filter==="en") ok=c.enable!==false;
-        else if(filter==="expired") ok=exp>0&&exp<now;
+        else if(filter==="expired") ok=false;   // f46: برداشته شد
         if(ok) hits.push({pid:p.id,panel:p.name,email:c.email,daysLeft,remGB:(rem===Infinity?"∞":(rem/1073741824).toFixed(1))});
       }
     }
@@ -11611,7 +11688,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       [btn(L(lang,"💬 گفتگوهای پشتیبانی","💬 Support history"),"pub:suphist")],
 
       sepBtn("پنل و قالب","Panels & plans"),
-      [btn(btnLabels.panels,"pub:panels"), btn(btnLabels.inbounds,"pub:inbounds")],
+      /* f46 (خواستهٔ کاربر): مدیریتِ پنل‌ها به «پنل‌ها» در منوی عادی منتقل شد */
+      [btn(btnLabels.inbounds,"pub:inbounds")],
       [btn(btnLabels.plans,"pub:plans"), btn(btnLabels.limit,"pub:limit")],
 
       sepBtn("کانال و ظاهر","Channel & appearance"),
@@ -13169,7 +13247,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const lines=[
       L(lang,"🖥 *اولویت پنل‌های عمومی*","🖥 *Public panel priority*"),
       L(lang,"بالاتر = اولویت بیشتر برای ساخت اکانت.","Higher = higher priority for new accounts."),
-      L(lang,"بعد از رسیدن مصرف به *","After usage reaches *")+lim+L(lang,"GB* → پنل بعدی.","GB* → next panel."),
+      L(lang,"سقفِ پیش‌فرضِ هر پنل: *","Default cap per panel: *")+lim+L(lang,"GB* (هر پنل می‌تواند سقفِ خودش را داشته باشد).","GB* (each panel can override)."),
       "",
     ];
 
@@ -13185,7 +13263,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         const upBtn=btn("⬆️","pub:up:"+p.id);
         const downBtn=btn("⬇️","pub:down:"+p.id);
         const rmBtn=btn(L(lang,"❌ حذف","❌ Remove"),"pub:panel:"+p.id);
+        const capTxt=(Number(p.publicLimitGB)>0)?("📊 "+Number(p.publicLimitGB)+"GB"):("📊 "+lim+"GB");
         rows.push([btn((i+1)+". "+p.name,"noop"), upBtn, downBtn, rmBtn]);
+        rows.push([btn(capTxt,"pm:vol:"+p.id)]);
       }
     }
 
@@ -13199,8 +13279,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       }
     }
 
-    rows.push([btn(L(lang,"📉 سقف مصرف (","📉 Cap (")+lim+"GB)","pub:limit")]);
-    rows.push([btn("◀","m:public")]);
+    rows.push([btn(L(lang,"📉 سقف کلیِ پیش‌فرض (","📉 Global default cap (")+lim+"GB)","pub:limit")]);
+    rows.push([btn(L(lang,"📊 حجمِ قابل فروش هر پنل","📊 Sellable volume per panel"),"pm:volpick")]);
+    rows.push([btn("◀","m:panels")]);
     await this.editOrSend(chat,mid,lines.join("\n"), kb(rows));
   }
 
@@ -15420,7 +15501,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       [btn(L(lang,`⏰ در حال انقضا ≤ ${expLow} روز`,`⏰ Expiring ≤ ${expLow} days`),"adv:exp_low"), btn(L(lang,`⏰ در حال انقضا ≤ ${expHigh} روز`,`⏰ Expiring ≤ ${expHigh} days`),"adv:exp_high")],
       [btn(L(lang,`📉 ترافیک ≤ ${trLow} گیگ`,`📉 Traffic ≤ ${trLow} GB`),"adv:tr_low"), btn(L(lang,`📉 ترافیک ≤ ${trHigh} گیگ`,`📉 Traffic ≤ ${trHigh} GB`),"adv:tr_high")],
       [btn(L(lang,"🔴 کاربران غیرفعال","🔴 Disabled users"),"adv:dis"), btn(L(lang,"🟢 کاربران فعال","🟢 Enabled users"),"adv:en")],
-      [btn(L(lang,"💀 منقضی شده","💀 Expired"),"adv:expired")],
+      /* f46: فیلترِ «💀 منقضی شده» حذف شد — کاربرِ منقضی از جست‌وجو بیرون است */,
       [btn(L(lang,"◀ بازگشت به منو","◀ Back to menu"), "m:main")]
     ];
     
@@ -15441,6 +15522,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       try{clients=await api.getClients();}catch{}
       for(const c of clients){
         if (isPublicLikeClientEmail(c.email)) continue; // exclude public/preview users
+        if(clientIsExpired(c)) continue;            // 🔎 f46: منقضی‌ها کلاً حذف
         if((c.email||"").toLowerCase().includes(lower)||(c.uuid||"").toLowerCase().includes(lower)||String(c.id||"").includes(lower)){
           matches.push({...c,_panel:p});
         }
@@ -17122,7 +17204,8 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     for(const p of panels){
       lines.push((p.enabled?"🟢":"🔴")+"  *"+esc(p.name)+"*");
       lines.push("`"+p.url+"`");
-      lines.push("⏳  "+fmtPanelExpiry(p.expiryDate,lang)+"  ·  💾 "+(p.trafficLimitGB!=null&&p.trafficLimitGB>0?(p.trafficLimitGB+" GB"):L(lang,"نامحدود","Unlimited")));
+      lines.push("⏳  "+fmtPanelExpiry(p.expiryDate,lang)+"  ·  💾 "+(p.trafficLimitGB!=null&&p.trafficLimitGB>0?(p.trafficLimitGB+" GB"):L(lang,"نامحدود","Unlimited"))
+        +"  ·  📊 "+(Number(p.publicLimitGB)>0?(Number(p.publicLimitGB)+" GB"):L(lang,"پیش‌فرض","default")));
       if(p.created_at) lines.push("📅  "+new Date(p.created_at).toISOString().slice(0,10));
       lines.push("");
     }
@@ -17301,10 +17384,306 @@ if(active && active.reachable && active.client && !active.expired && !active.not
 
 
   // ---- Add Panel ----
+  /* ═════════════ ➕ f46: افزودنِ پنل — توکن‌محور با پیش‌نمایش و تأیید ═════════════
+     *  قبلاً: نام → آدرس → توکن → مهلت (۴ قدم دستی).
+     *  حالا:   توکن ⇒ آدرس خودکار ⇒ کارتِ پیش‌فرض‌ها ⇒ یک دکمهٔ تأیید.
+     *  پیش‌فرض‌ها: نام = x(آخرین+۱) · مهلت = ۳۰ روز · دسته = عمومی · حجم = ۷۵ گیگ.
+     *  همهٔ خطوط جداگانه قابلِ ویرایش‌اند و حجم هم برای هر پنل جداست.
+     */
   async startAddPanel(chat,mid) {
     const uid=await this.ownerId();
-    await this.store.setState(uid,"add_name",{});
-    await this.editOrSend(chat,mid,"➕ Enter *panel name*:",(await this.backPanels()));
+    const lang=await this.lang();
+    await this.store.setState(uid,"add2_token",{});
+    await this.editOrSend(chat,mid,
+      L(lang,"➕ *افزودن پنل*\n\n🔑 *توکن پنل* را بفرست (مثل `user:pass`).\nآدرس را خودم پیدا می‌کنم؛ اگر پیدا نشد از خودت می‌پرسم.\n\n_می‌توانی آدرس و توکن را با هم هم بفرستی؛ مثلاً:_\n`https://host/path user:pass`",
+              "➕ *Add panel*\n\n🔑 Send the *panel token* (e.g. `user:pass`).\nI'll find the URL myself; if not, I'll ask.\n\n_You can also send both:_\n`https://host/path user:pass`"),
+      (await this.backPanels()));
+  }
+
+  /** آدرسِ پنل را از روی توکن بین آدرس‌هایِ شناخته‌شده پیدا می‌کند. */
+  async _detectPanelUrl(token) {
+    if(!token) return "";
+    const cands=[];
+    const push=u=>{ const n=normalizePanelUrl(u); if(n && cands.indexOf(n)<0) cands.push(n); };
+    try{ for(const p of ((await this.store.getPanels())||[])) push(p.url); }catch(e){}
+    try{
+      for(const p of ((await this.store.getPanels())||[])){
+        const v=await this.store.get("ib:hosts:"+String(p.id));
+        const o=(v && typeof v==="object")?v:JSON.parse(String(v||"{}"));
+        for(const h of ((o&&o.h)||[])) push(h);
+      }
+    }catch(e){}
+    for(const u of cands.slice(0,8)){
+      try{ await new PanelApi("probe",u,token,0).testConnection(); return u; }catch(e){}
+    }
+    return "";
+  }
+
+  /** پیش‌فرض‌های پنلِ تازه. */
+  _addDefaults(panels){
+    return { name: nextPanelName(panels), days: 30, cat: "public", gb: 75 };
+  }
+
+  async onAddTokenV2(chat,uid,text) {
+    const lang=await this.lang();
+    const st0=await this.store.getState(uid);
+    const savedUrl=(st0 && st0.data && st0.data.url)||"";
+    const parsed=parsePanelInput(text);
+    let token=parsed.token;
+    let url=parsed.url||savedUrl;
+    let auto=false;
+    // اگر فقط آدرس فرستاد (بدونِ توکن) ⇒ توکن را می‌پرسیم و آدرس را نگه می‌داریم
+    if(!token){
+      await this.store.setState(uid,"add2_token",{url:url});
+      return this.tg.msg(chat, L(lang,"🔑 حالا توکنِ همین پنل را بفرست (مثل `user:pass`):","🔑 Now send this panel's token (e.g. `user:pass`):"));
+    }
+    if(!url){
+      await this.tg.msg(chat,L(lang,"🔎 دنبالِ آدرسِ پنل می‌گردم…","🔎 Looking for the panel URL…"));
+      url=await this._detectPanelUrl(token);
+      auto=true;
+    }
+    if(!url){
+      await this.store.setState(uid,"add2_url",{token});
+      return this.tg.msg(chat,
+        L(lang,"🌐 آدرسی که این توکن روی آن کار کند پیدا نکردم.\nآدرس را بفرست (مثل `https://host/path`):",
+                "🌐 I couldn't find a URL this token works on.\nSend it (e.g. `https://host/path`):"));
+    }
+    return this._showAddPreview(chat,uid,url,token,auto);
+  }
+
+  async onAddUrlV2(chat,uid,text) {
+    const state=await this.store.getState(uid);
+    const token=(state&&state.data&&state.data.token)||"";
+    const url=normalizePanelUrl(text);
+    if(!url){
+      return this.tg.msg(chat,"❌ "+L(lang,"آدرس نامعتبر است. دوباره بفرست (https://host/path).","Invalid URL — send again (https://host/path)."));
+    }
+    return this._showAddPreview(chat,uid,url,token,false);
+  }
+
+  /** کارتِ پیش‌نمایش: هر خط یک دکمهٔ ویرایش + تأیید. */
+  async _showAddPreview(chat,uid,url,token,autoUrl,keep) {
+    const lang=await this.lang();
+    const panels=await this.store.getPanels();
+    const d=this._addDefaults(panels);
+    // keep = پیش‌نویسِ ویرایش‌شده (نام/مهلت/حجم/دسته) — وگرنه پیش‌فرض‌ها
+    const base=(keep && typeof keep==="object")?keep:d;
+    const draft={
+      url: url||base.url,
+      token: token||base.token,
+      name: base.name||d.name,
+      days: (base.days!=null)?base.days:d.days,
+      cat: base.cat||d.cat,
+      gb: (base.gb!=null)?base.gb:d.gb,
+      autoUrl: !!autoUrl,
+    };
+    await this.store.setState(uid,"add2_confirm",draft);
+    const tokenShown=String(token).length>16?String(token).slice(0,8)+"…":String(token);
+    const lines=[
+      uiHead("➕", L(lang,"افزودن پنل","Add panel"), L(lang,"پیش‌نمایش و تأیید","Preview & confirm")),
+      "",
+      "🌐 "+L(lang,"آدرس: ","URL: ")+"`"+url+"`"+(autoUrl?L(lang,"  _(خودکار)_","  _(auto)_"):""),
+      "🔑 "+L(lang,"توکن: ","Token: ")+"`"+tokenShown+"`",
+      uiSep(),
+      "📛 "+L(lang,"نام پنل: *","Name: *")+esc(draft.name)+"*",
+      "⏱ "+L(lang,"مهلت پنل: *","Panel days: *")+draft.days+L(lang," روز*"," days*"),
+      "📂 "+L(lang,"دسته: *","Category: *")+(draft.cat==="public"?L(lang,"عمومی","Public"):L(lang,"عادی","Normal"))+"*",
+      "📊 "+L(lang,"حجمِ قابل فروش: *","Sellable volume: *")+draft.gb+" GB*",
+      uiSep(),
+      L(lang,"اگر درست است «✅ تأیید و ساخت» را بزن؛ هر خط را هم می‌توانی جدا عوض کنی.",
+              "Tap “✅ Create” if it's right; each line can be edited separately."),
+    ];
+    await this.tg.msg(chat, lines.join("\n"), {reply_markup:kb([
+      [btn(L(lang,"✅ تأیید و ساخت","✅ Create"),"addc:ok")],
+      [btn("✏️ "+L(lang,"نام","Name"),"addc:name"), btn("⏱ "+L(lang,"مهلت","Days"),"addc:days")],
+      [btn("📊 "+L(lang,"حجم","Volume"),"addc:gb"), btn("📂 "+L(lang,"دسته","Category"),"addc:cat")],
+      [btn(L(lang,"❌ لغو","❌ Cancel"),"m:panels")],
+    ])});
+  }
+
+  /** ویرایشِ خطِ نام. */
+  async addEditName(chat,mid,uid) {
+    const lang=await this.lang();
+    const st=await this.store.getState(uid);
+    if(!st||st.flow!=="add2_confirm"||!st.data) return this.tg.msg(chat,L(lang,"⌛️ مرحله منقضی شد.","⌛️ Step expired."));
+    await this.store.setState(uid,"add2_name",st.data);
+    await this.editOrSend(chat,mid,L(lang,"📛 نامِ پنل را بفرست (پیش‌فرض: *","📛 Send the panel name (default: *")+st.data.name+L(lang,"*)","*)"),(await this.backPanels()));
+  }
+  async addEditDays(chat,mid,uid) {
+    const lang=await this.lang();
+    const st=await this.store.getState(uid);
+    if(!st||st.flow!=="add2_confirm"||!st.data) return this.tg.msg(chat,L(lang,"⌛️ مرحله منقضی شد.","⌛️ Step expired."));
+    await this.store.setState(uid,"add2_days",st.data);
+    await this.editOrSend(chat,mid,L(lang,"⏱ مهلتِ پنل چند روز باشد؟ (پیش‌فرض ۳۰ — عدد بفرست، ۰ = نامحدود)","⏱ How many days? (default 30 — send a number, 0 = unlimited)"),(await this.backPanels()));
+  }
+  async addEditGb(chat,mid,uid) {
+    const lang=await this.lang();
+    const st=await this.store.getState(uid);
+    if(!st||st.flow!=="add2_confirm"||!st.data) return this.tg.msg(chat,L(lang,"⌛️ مرحله منقضی شد.","⌛️ Step expired."));
+    await this.store.setState(uid,"add2_gb",st.data);
+    await this.editOrSend(chat,mid,L(lang,"📊 حجمِ قابل فروشِ این پنل چند گیگ باشد؟ (پیش‌فرض ۷۵)","📊 Sellable volume for this panel in GB? (default 75)"),(await this.backPanels()));
+  }
+  async onAddName2(chat,uid,text) {
+    const st=await this.store.getState(uid);
+    const d=Object.assign({},(st&&st.data)||{});
+    const name=String(text||"").trim();
+    if(!name) return this.tg.msg(chat,"❌ Empty name.");
+    d.name=name.slice(0,40);
+    await this.store.setState(uid,"add2_confirm",d);
+    return this._showAddPreview(chat,uid,d.url,d.token,d.autoUrl,d);
+  }
+  async onAddDays2(chat,uid,text) {
+    const st=await this.store.getState(uid);
+    const d=Object.assign({},(st&&st.data)||{});
+    d.days=Math.max(0, parseInt(String(text).replace(/[^0-9]/g,""),10)||0);
+    await this.store.setState(uid,"add2_confirm",d);
+    return this._showAddPreview(chat,uid,d.url,d.token,d.autoUrl,d);
+  }
+  async onAddGb2(chat,uid,text) {
+    const st=await this.store.getState(uid);
+    const d=Object.assign({},(st&&st.data)||{});
+    d.gb=Math.max(0, parseFloat(String(text).replace(",","."))||0);
+    await this.store.setState(uid,"add2_confirm",d);
+    return this._showAddPreview(chat,uid,d.url,d.token,d.autoUrl,d);
+  }
+  /** دکمهٔ «📂 دسته»: عمومی ⇄ عادی. اگر عادی شد، اسم را از خودش می‌پرسد. */
+  async addToggleCat(chat,mid,uid) {
+    const lang=await this.lang();
+    const st=await this.store.getState(uid);
+    if(!st||st.flow!=="add2_confirm"||!st.data) return this.tg.msg(chat,L(lang,"⌛️ مرحله منقضی شد.","⌛️ Step expired."));
+    const d=Object.assign({},st.data);
+    d.cat=(d.cat==="public")?"normal":"public";
+    await this.store.setState(uid,"add2_confirm",d);
+    if(d.cat==="normal"){
+      // خواستهٔ کاربر: «اگه بردم تو دسته عادی ازم اسم بخاد»
+      await this.store.setState(uid,"add2_name",d);
+      return this.editOrSend(chat,mid,
+        L(lang,"📂 دسته ⇒ *عادی*.\n\n📛 حالا نامِ پنل را بفرست:","📂 Category ⇒ *Normal*.\n\n📛 Now send the panel name:"),
+        (await this.backPanels()));
+    }
+    return this._showAddPreview(chat,uid,d.url,d.token,d.autoUrl);
+  }
+
+  /** ✅ تأیید: پنل ساخته می‌شود (با حجمِ مخصوصِ خودش و دستهٔ انتخابی). */
+  async onAddConfirm(chat,mid,uid) {
+    const lang=await this.lang();
+    const st=await this.store.getState(uid);
+    if(!st||st.flow!=="add2_confirm"||!st.data||!st.data.url||!st.data.token){
+      return this.tg.msg(chat,L(lang,"⌛️ این مرحله منقضی شد — از «➕ افزودن پنل» دوباره شروع کن.","⌛️ This step expired — start again from “➕ Add panel”."));
+    }
+    const d=st.data;
+    let newId=null;
+    await this.store.withLock("panels",15,async()=>{
+      const panels=await this.store.getPanels();
+      newId=panels.length?Math.max(...panels.map(p=>p.id))+1:1;
+      const days=Number(d.days)||0;
+      const gb=Number(d.gb)||0;
+      panels.push({
+        id:newId,
+        name:d.name||nextPanelName(panels),
+        url:d.url,
+        token:d.token,
+        enabled:true,
+        created_at:new Date().toISOString(),
+        expiryDate: days>0 ? new Date(Date.now()+days*86400000).toISOString() : null,
+        publicLimitGB: gb>0 ? gb : null,
+      });
+      await this.store.savePanels(panels);
+    });
+    if(newId==null){ return this.tg.msg(chat,"❌ Panel create failed."); }
+    await this.store.clearState(uid);
+    let catMsg="";
+    try{ await this._setPanelPublic(newId, d.cat==="public"); catMsg=(d.cat==="public")?L(lang,"🌐 عمومی","🌐 Public"):L(lang,"🖥 عادی","🖥 Normal"); }catch(e){}
+    let okConn=true, errTxt="";
+    try{ await new PanelApi(d.name, d.url, d.token, newId).testConnection(); }
+    catch(e){ okConn=false; errTxt=String((e&&e.message)||e); }
+    const lines=[
+      (okConn?"✅ ":"⚠️ ")+"*"+esc(d.name)+"* — "+(okConn?L(lang,"اضافه شد و اتصالش برقرار است.","added and connected."):L(lang,"اضافه شد ولی اتصال برقرار نشد.","added, but connection failed.")),
+      "",
+      "🌐 `"+d.url+"`",
+      "⏱ "+L(lang,"مهلت: ","Days: ")+(Number(d.days)>0?(d.days+L(lang," روز"," days")):L(lang,"نامحدود","Unlimited")),
+      "📂 "+L(lang,"دسته: ","Category: ")+catMsg,
+      "📊 "+L(lang,"حجمِ قابل فروش: ","Sellable: ")+((Number(d.gb)>0)?(d.gb+" GB"):L(lang,"پیش‌فرضِ کلی","global default")),
+    ];
+    if(!okConn && errTxt) lines.push("", "⚠️ `"+esc(errTxt).slice(0,160)+"`");
+    await this.tg.msg(chat, lines.join("\n"), {reply_markup:kb([
+      [btn(L(lang,"📋 لیست پنل‌ها","📋 Panels"),"pm:list"), btn(L(lang,"📊 حجم","📊 Volume"),"pm:vol:"+newId)],
+      [btn(L(lang,"🌐 پنل‌های عمومی","🌐 Public panels"),"pm:pubpanels"), btn(L(lang,"➕ پنل بعدی","➕ Next panel"),"pm:add")],
+    ])});
+  }
+
+  /** ثبتِ دسته بدون رابط (برای مسیرِ ساختِ پنل). */
+  async _setPanelPublic(pid, makePublic) {
+    const panels=await this.store.getPanels();
+    const cfg=await this.store.getPublicCfg();
+    let ids=(cfg.publicPanelIds||[]).map(String).filter(Boolean);
+    const key=String(pid);
+    if(makePublic){
+      if(!ids.length) ids=panels.filter(x=>x.enabled && String(x.id)!==key).map(x=>String(x.id));
+      ids=ids.filter(x=>x!==key);
+      ids.push(key);
+    }else{
+      if(!ids.length) ids=panels.filter(x=>x.enabled && String(x.id)!==key).map(x=>String(x.id));
+      else ids=ids.filter(x=>x!==key);
+    }
+    const valid=new Set(panels.map(p=>String(p.id)));
+    cfg.publicPanelIds=ids.filter(id=>valid.has(id));
+    await this.store.savePublicCfg(cfg);
+    try{ await this._clearPanelLimitWarnings(); }catch(e){}
+    return true;
+  }
+
+  /* ── 📊 حجمِ قابل فروشِ هر پنل ── */
+  async pmVolumePick(chat,mid) {
+    const lang=await this.lang();
+    const panels=await this.panelsForUser(this._uid || await this.ownerId());
+    if(!panels.length) return this.editOrSend(chat,mid,t(lang,"no_panels"),(await this.backPanels()));
+    const cfg=await this.store.getPublicCfg();
+    const gLim=Number(cfg.publicPanelLimitGB)>0?Number(cfg.publicPanelLimitGB):75;
+    const rows=panels.map(p=>{
+      const v=(Number(p.publicLimitGB)>0)?(Number(p.publicLimitGB)+" GB"):(gLim+" GB ("+L(lang,"پیش‌فرض","default")+")");
+      return [btn(p.name+" — "+v,"pm:vol:"+p.id)];
+    });
+    rows.push([btn(L(lang,"◀ پنل‌ها","◀ Panels"),"m:panels")]);
+    await this.editOrSend(chat,mid,
+      L(lang,"📊 *حجمِ قابل فروشِ هر پنل*\nمقدارِ هر پنل جداست؛ اگر خالی باشد سقفِ کلی ("+gLim+"GB) حساب می‌شود.\nپنل را انتخاب کن:",
+              "📊 *Sellable volume per panel*\nEach panel can have its own value; empty = global cap ("+gLim+"GB).\nPick a panel:"),
+      kb(rows));
+  }
+  async startPanelVolume(chat,mid,pid) {
+    const lang=await this.lang();
+    const uid=await this.ownerId();
+    const panels=await this.panelsForUser(this._uid || await this.ownerId());
+    const p=panels.find(x=>String(x.id)===String(pid));
+    if(!p) return this.editOrSend(chat,mid,L(lang,"❌ پنل پیدا نشد.","❌ Panel not found."),(await this.backPanels()));
+    await this.store.setState(uid,"pm_vol_gb",{pid});
+    const cur=(Number(p.publicLimitGB)>0)?(Number(p.publicLimitGB)+" GB"):L(lang,"پیش‌فرضِ کلی","global default");
+    await this.editOrSend(chat,mid,
+      L(lang,"📊 حجمِ قابل فروشِ *","📊 Sellable volume for *")+esc(p.name)+L(lang,"*\nفعلی: *","*\nCurrent: *")+cur+L(lang,"*\n\nعدد را به گیگ بفرست (مثلاً 75).\n0 = برگشت به پیش‌فرضِ کلی.",
+              "*\n\nSend the number in GB (e.g. 75).\n0 = fall back to the global default."),
+      (await this.backPanels()));
+  }
+  async onPanelVolumeGb(chat,uid,text) {
+    const state=await this.store.getState(uid);
+    if(!state||!state.data||state.data.pid==null) return;
+    const pid=state.data.pid;
+    const num=parseFloat(String(text).replace(",","."))||0;
+    let pName="", found=false;
+    await this.store.withLock("panels",15,async()=>{
+      const panels=await this.store.getPanels();
+      const p=panels.find(x=>String(x.id)===String(pid));
+      if(!p) return;
+      p.publicLimitGB = num>0 ? num : null;
+      await this.store.savePanels(panels);
+      pName=p.name; found=true;
+    });
+    if(!found){ await this.store.clearState(uid); return; }
+    await this.store.clearState(uid);
+    const lang=await this.lang();
+    try{ await this._clearPanelLimitWarnings(); }catch(e){}
+    await this.tg.msg(chat,
+      L(lang,"✅ حجمِ قابل فروشِ *","✅ Sellable volume of *")+esc(pName)+"* = *"+(num>0?(num+" GB"):L(lang,"پیش‌فرضِ کلی","global default"))+"*",
+      {reply_markup:(await this.panelsMenu())});
   }
   async onAddPanelName(chat,uid,name) {
     await this.store.setState(uid,"add_url",{name});
@@ -20134,14 +20513,20 @@ if(active && active.reachable && active.client && !active.expired && !active.not
         const exp=c.expiryTime||0;
         const daysLeft=exp?Math.ceil((exp-now)/86400000):9999;
 
+        // 🔎 f46 (خواستهٔ کاربر): کاربرِ منقضی در *هیچ* فیلتری نمی‌آید — کلاً حذف شده.
+        if(clientIsExpired(c)) continue;
         let ok=false;
         if(filter==="exp_low") ok=exp>0&&daysLeft>=0&&daysLeft<=expLow;
         else if(filter==="exp_high") ok=exp>0&&daysLeft>=0&&daysLeft<=expHigh;
         else if(filter==="tr_low") ok=tr.total>0&&rem<=trLow0*1073741824&&rem>=0;
         else if(filter==="tr_high") ok=tr.total>0&&rem<=trHigh0*1073741824&&rem>=0;
-        else if(filter==="dis") ok=c.enable===false; // d43: سازگار با clientStatus/اسنپ‌شات
+        /* 🔎 f46 (خواستهٔ کاربر): «غیرفعال» = فقط کاربرِ واقعاً خاموش. منقضی‌ها
+           چند خط بالاتر کلاً حذف می‌شوند، پس دیگر داخلِ این لیست قاطی نمی‌شوند
+           (شکایتِ کاربر دقیقاً همین بود). کاربرِ خاموشی که حجم/زمان دارد هم
+           می‌ماند، چون می‌خواهی ببینی‌اش و دوباره روشنش کنی. */
+        else if(filter==="dis") ok=c.enable===false;
         else if(filter==="en") ok=c.enable!==false;
-        else if(filter==="expired") ok=exp>0&&exp<now;
+        else if(filter==="expired") ok=false;   // f46: برداشته شد
         if(ok) hits.push({pid:p.id,panel:p.name,email:c.email,daysLeft,remGB:(rem===Infinity?"∞":(rem/1073741824).toFixed(1))});
       }
     }
