@@ -48,11 +48,28 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-26-f49";
+const CODE_STAMP = "2026-09-26-f50";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
 const KEYS = { INSTALLED: "cfg:installed", BOT_TOKEN: "cfg:bot_token", OWNER_ID: "cfg:owner_id", ENCRYPTION_KEY: "cfg:enc_key", WEBHOOK_SECRET: "cfg:wh_secret", WEBHOOK_SECRET_APPLIED: "cfg:wh_secret_applied", ADMIN_KEY: "cfg:admin_key", WEBHOOK_URL: "cfg:webhook_url", WEBHOOK_INITIALIZED: "cfg:webhook_initialized", PANELS: "panels", SETTINGS: "settings", ADMINS: "admins", LANG: "lang", PLANS: "plans", LOGS: "op_logs", WATCHLIST: "watchlist", ADMIN_PANELS: "admin_panels", CF_DEPLOY: "cfg:cf_deploy", DEPLOY_PENDING: "cfg:deploy_pending", BOT_USERS: "bot_users", PUBLIC_CFG: "cfg:public", BACKUPS: "cfg:backups", PENDING_CFGS: "pub:pending_cfgs", PANEL_RESERVE: "pub:panel_reserve", DIAG_TOKEN: "cfg:diag_token", NOTIF_BOARD: "cfg:notif_board", SUPPORT_HISTORY: "support:history", CHANNEL_LAST: "pub:channel:last", IB_SECRET: "cfg:ib_secret" };
+/**
+ * f50 (سهمیهٔ خواندن): کلیدهایی که با «دستِ ادمین/مالک» عوض می‌شوند و
+ * خواندنِ مکررشان در هر آپدیت و هر دقیقهٔ کرون هیچ سودی ندارد.
+ * ارزش = عمرِ ریزکش به میلی‌ثانیه (خودِ ایزوله، در حافظه).
+ *
+ * ⚠️ اینجا **هیچ کلیدِ ظرفیت/قفل/کاربر** نیست: `panels`، `bot_users`،
+ *    `pub:panel_reserve` و کلیدهای `lock:`/`rl:`/`c:` عمداً بیرون‌اند تا
+ *    منطقِ ظرفیت و ضدِتکرار و هم‌زمانی دقیقاً مثلِ قبل بماند.
+ */
+const READ_CACHE_MS = {
+  [KEYS.SETTINGS]: 3000,
+  [KEYS.LANG]: 3000,
+  [KEYS.PLANS]: 3000,
+  [KEYS.ADMINS]: 3000,
+  [KEYS.WEBHOOK_SECRET]: 10000,
+  [KEYS.INSTALLED]: 10000,
+};
 const STATS_GROUP_NAME = "xpanel-stats";
 const CACHE_TTL = { STATS: 30, CLIENTS: 30, ONLINE: 10, INBOUNDS: 60 };
 /**
@@ -1541,7 +1558,14 @@ function isSubreqErr(x){
 /** f48: «سقفِ روزانهٔ نوشتنِ D1» — تا ۰۰:۰۰ UTC نوشتن‌ها رد می‌شوند. */
 function isQuotaErr(x){
   const m = String((x && (x.message || x.description)) || x || "");
-  return /daily row write limit|row write limit|exceeded D1/i.test(m);
+  // f50: سقفِ «خواندن» را هم می‌شناسیم، نه فقط نوشتن — رفتارِ رحم‌آمیز
+  //      (پیام + ۲۰۰ جای ۵۰۳) باید برای هر دو سقف یکسان باشد.
+  return /daily row (write|read) limit|row (write|read) limit|exceeded D1's free tier|exceeded D1/i.test(m);
+}
+/** f50: خطای ذخیره‌سازی (سقفِ سهمیه یا خطای گذرا) — برای «مسیرِ نجات». */
+function isStorageErr(x){
+  const m = String((x && (x.message || x.description)) || x || "");
+  return isQuotaErr(m) || /D1_ERROR|Network connection lost|internal error/i.test(m);
 }
 /**
  * f49: شکنندهٔ طوفانِ بازارسال.
@@ -2721,7 +2745,34 @@ class Store {
    * اگر خودِ D1 خطا بدهد، خطا بالا می‌رود و به KV نگاه نمی‌کنیم —
    * دلیلش در JSDoc `_d1GetRaw` توضیح داده شده.
    */
+  /** f50: خواندن با مموی درون‌اجرا + ریزکشِ ایزولهٔ کوتاه برای کلیدهای تنظیمی. */
   async get(k) {
+    // ۱) مموی همین اجرا: در یک درخواست، هر کلید حداکثر یک‌بار از D1 خوانده
+    //    می‌شود. صفر ریسکِ کهنگی — ابتدا/انتها‌ی عمرِ همین اجرا است و هر
+    //    نوشتن (`put`/`del`) همان کلید را از ممو پاک می‌کند.
+    if(this._memo && this._memo.has(k)) return this._memo.get(k);
+    // ۲) ریزکشِ ایزوله (۳ ثانیه) — فقط کلیدهای تنظیمیِ جدولِ READ_CACHE_MS.
+    const ttlMs=READ_CACHE_MS[k]|0;
+    if(ttlMs>0 && globalThis.__readCache){
+      const e=globalThis.__readCache.get(k);
+      if(e && (Date.now()-e.at)<ttlMs) return e.v;
+    }
+    const v=await this._getUncached(k);
+    this._memoPut(k, v);
+    if(ttlMs>0){
+      if(!globalThis.__readCache) globalThis.__readCache=new Map();
+      if(globalThis.__readCache.size>500) globalThis.__readCache.clear();
+      globalThis.__readCache.set(k, {v:v, at:Date.now()});
+    }
+    return v;
+  }
+  _memoPut(k,v){ if(!this._memo) this._memo=new Map(); this._memo.set(k, v); }
+  /** پاک‌کردنِ کشِ همان کلید بعد از هر نوشتن (چه ممو چه ریزکشِ ایزوله). */
+  _cacheDrop(k){
+    try{ if(this._memo) this._memo.delete(k); }catch{}
+    try{ if(globalThis.__readCache) globalThis.__readCache.delete(k); }catch{}
+  }
+  async _getUncached(k) {
     await this.ready();
     if(this.db){
       // خطای D1 اینجا throw می‌شود (نه سقوط به دادهٔ منجمدِ KV)
@@ -2767,6 +2818,7 @@ class Store {
    *    برای تشخیص تازه‌ترین نسخه بازنویسی شود.
    */
   async put(k,v,t) {
+    this._cacheDrop(k);          // f50: کشِ خواندنِ همین کلید باطل شود
     await this.ready();
     const val = typeof v==="string" ? v : JSON.stringify(v);
     if(this.db){
@@ -2796,6 +2848,7 @@ class Store {
   }
 
   async del(k, strict) {
+    this._cacheDrop(k);          // f50
     await this.ready();
     if(this.db) await this._d1DelRaw(k, strict===true);
     // 🔴 f14: حذف KV بی‌صدا می‌ماند ولی دیگر خطرناک نیست — بعد از مهاجرت
@@ -3260,6 +3313,21 @@ class Store {
         //    یعنی ردیفی از قبل هست. اکثر قفل‌ها تازه‌اند ⇒ DELETE حذف می‌شود
         //    و هزینهٔ عادیِ هر acquireLock نصف می‌شود.
         const token=randId(20)+":"+now;
+        // f50: مثلِ claimUpdate — یک دستور، هم درجِ تازه هم بازپس‌گیریِ قفلِ
+        //   منقضی (شرطِ WHERE روی DO UPDATE). قبلاً وقتی ردیفِ منقضی می‌ماند،
+        //   مسیرِ «DELETE بعد دوباره INSERT» می‌رفت ⇒ ۲ تا ۳ نوشتن.
+        try{
+          const r=await this.db.prepare(
+            "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) "+
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at "+
+            "WHERE store.expires_at IS NULL OR store.expires_at<=? "+
+            "RETURNING value"
+          ).bind(k, token, now+ttl*1000, now).first();
+          if(r && String(r.value)===token) return token;
+          return false;                        // قفلِ زندهٔ دیگری ⇒ شلوغ است
+        }catch(_oldSql){
+          // مسیرِ پشتیبان برای SQLiteهایی که DO UPDATE…WHERE/RETURNING ندارند
+        }
         const res=await this.db.prepare(
           "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING"
         ).bind(k, token, now+ttl*1000).run();
@@ -3287,6 +3355,9 @@ class Store {
         return (row && String(row.value)===token) ? token : false;
       }catch(e){
         console.error("acquireLock d1", e&&e.message);
+        // f50: خطای ذخیره‌سازی را نگه می‌داریم تا «مسیرِ نجات» (دیپلوی در
+        //   بحران) بفهمد قفل به‌خاطر خطا گرفته نشده، نه به‌خاطر رقابت.
+        try{ this._lastLockErr = isStorageErr(e) ? String((e&&e.message)||e) : null; }catch{}
         // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — High): دیگر به قفل حافظه‌ای
         //    سقوط نمی‌کنیم. globalThis بین ایزوله‌های Worker مشترک نیست؛
         //    در قطعیِ D1 دو ایزوله هر دو «قفل موفق» می‌گرفتند و همان
@@ -21425,7 +21496,14 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     if(!(rec && rec.unlimited) && used >= DIAG_MAX_DEPLOYS) return { ok:false, error:"deploy limit for this token", kvTouched:false, d1Touched:false };
 
     const lockTok = await this.store.acquireLock("cf_deploy", 120);
-    if (!lockTok) return { ok:false, error:"another deploy is running", kvTouched:false, d1Touched:false };
+    if (!lockTok) {
+      // f50: اگر قفل به‌خاطرِ خطای ذخیره‌سازی گرفته نشد (سقفِ سهمیه/قطعی)،
+      //   دیپلوی را متوقف نکن. این «مسیرِ نجات» است و دقیقاً در همین شرایط
+      //   باید کار کند؛ وگرنه فیکس را نمی‌شود بالا برد.
+      const se = this.store._lastLockErr;
+      if (!se) return { ok:false, error:"another deploy is running", kvTouched:false, d1Touched:false };
+      console.error("cf_deploy lock unavailable (storage): "+se+" — proceeding without lock");
+    }
     try {
       await this.deployWorkerPreserveBindings(cfg, scriptSource);
       const next = { ...rec, deploys: used + 1, lastDeployAt: Date.now() };
@@ -22763,7 +22841,16 @@ export default {
     }
 
     // Health check
-    if(url.pathname==="/health") return jsonRes({status:"ok",installed:await store.isInstalled(),storage:db?"D1":(kv?"KV":"none"),codeStamp:CODE_STAMP,ts:new Date().toISOString()});
+    if(url.pathname==="/health"){
+      // f50: این endpoint باید در «هر» شرایطی جواب بدهد — حتی وقتی سقفِ
+      //   خواندن/نوشتنِ D1 پر است. قبلاً یک خطای ذخیره‌سازی همین‌جا هم
+      //   می‌توانست ۵۰۰ بدهد و آن‌وقت هیچ راهِ عیب‌یابی نمی‌ماند.
+      let installed=null, degraded="";
+      try{ installed=await store.isInstalled(); }
+      catch(e){ degraded=isQuotaErr(e)?"quota":(isStorageErr(e)?"storage":"error"); }
+      return jsonRes({status:"ok",installed:(installed===true),storage:db?"D1":(kv?"KV":"none"),
+                      degraded:degraded||undefined,codeStamp:CODE_STAMP,ts:new Date().toISOString()});
+    }
 
     // 🚑 بازیابی اضطراری: اگر ربات ساکت شده و کلید مدیریتی در دسترس نیست،
     // با خودِ توکن ربات (که فقط مالک دارد) می‌توان وب‌هوک را ترمیم کرد
