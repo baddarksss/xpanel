@@ -48,7 +48,7 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-26-f47";
+const CODE_STAMP = "2026-09-26-f48";
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -1538,6 +1538,42 @@ function isSubreqErr(x){
   const m = String((x && (x.message || x.description)) || x || "");
   return /too many subrequests|subrequests|worker_invocation|exceeded/i.test(m);
 }
+/** f48: «سقفِ روزانهٔ نوشتنِ D1» — تا ۰۰:۰۰ UTC نوشتن‌ها رد می‌شوند. */
+function isQuotaErr(x){
+  const m = String((x && (x.message || x.description)) || x || "");
+  return /daily row write limit|row write limit|exceeded D1/i.test(m);
+}
+/**
+ * f48: خبرِ یک‌بارهٔ پر شدنِ سهمیهٔ نوشتن.
+ * ⚠️ عمداً هیچ نوشتنی در D1 ندارد (وگرنه خودش خطا می‌داد) — فقط حافظهٔ ایزوله.
+ */
+async function quotaNotice(store, token, update){
+  try{
+    if(!globalThis.__quotaNotified) globalThis.__quotaNotified=new Map();
+    const ch=(update && ((update.message && update.message.chat && update.message.chat.id)!=null
+            ? update.message.chat.id
+            : (update.callback_query && update.callback_query.message && update.callback_query.message.chat
+               ? update.callback_query.message.chat.id : null))) || null;
+    const txt="⛔️ ظرفیتِ ذخیره‌سازیِ ربات برای امروز پر شده است.\n"+
+              "تا ساعت ۰۳:۳۰ بامداد (۰۰:۰۰ UTC) دستورها اجرا نمی‌شوند؛ بعد از آن خودکار برمی‌گردد. 🙏\n\n"+
+              "⛔️ The bot's daily storage quota is full — it recovers automatically at 00:00 UTC.";
+    if(ch!=null && token){
+      const k="u"+String(ch);
+      if(!(Number(globalThis.__quotaNotified.get(k))||0) || (Date.now()-Number(globalThis.__quotaNotified.get(k)))>=15*60000){
+        globalThis.__quotaNotified.set(k, Date.now());
+        try{ await new Tg(token).msg(ch, txt); }catch{}
+      }
+    }
+    // مالک: حداکثر هر یک ساعت (خواندن از D1 مجاز است — فقط نوشتن بسته است)
+    if(Date.now()-(Number(globalThis.__quotaOwnerAt)||0)>=3600000){
+      globalThis.__quotaOwnerAt=Date.now();
+      try{
+        const ow=await store.getOwnerId();
+        if(ow && String(ow)!==String(ch)) await new Tg(token).msg(ow, "⛔️ سهمیهٔ روزانهٔ نوشتنِ D1 پر شد — ربات تا ۰۰:۰۰ UTC فقط خواندنی است.");
+      }catch{}
+    }
+  }catch{}
+}
 async function warn80OutboxRead(store){
   try{
     const raw = await store.get(W80_OUTBOX);
@@ -2943,34 +2979,51 @@ class Store {
       try{
         await this.ready();
         const tok=randId(20)+":"+Date.now();
-        const res=await this.db.prepare(
-          "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING"
-        ).bind(k, tok, Date.now()+(Number(ttlSec)||600)*1000).run();
-        let changed=(res&&res.meta&&typeof res.meta.changes==="number")
-          ? res.meta.changes
-          : (res&&typeof res.changes==="number" ? res.changes : null);
-        // 🔴 f15 (گزارش HIGH — reclaim منقضی): برخلاف acquireLock، رکورد
-        //    منقضیِ claim قبل از INSERT حذف نمی‌شد ⇒ conflict روی ردیفِ
-        //    مرده → «seen» ابدی ( Worker بعد از گرفتن claim کرش کند،
-        //    تا ۶۰۰ ثانیه همه «seen» می‌گرفتند و هیچ cleanup عام هم نیست).
-        //    حالا همان الگوی acquireLock: اول منقضی را پاک کن، بعد دوباره درج.
-        if(changed===0){
-          try{
-            await this.db.prepare("DELETE FROM store WHERE key=? AND expires_at IS NOT NULL AND expires_at<=?")
-              .bind(k, Date.now()).run();
-          }catch{}
-          const res2=await this.db.prepare(
+        const exp=Date.now()+(Number(ttlSec)||600)*1000;
+        // f48: یک نوشتنِ اتمیک. ردیفِ منقضی در «همان» دستور بازنویسی می‌شود
+        //   (شرطِ WHERE روی DO UPDATE) ⇒ دیگر DELETE+INSERT دومی لازم نیست و
+        //   مسیرِ قبلی (که تا ۳ نوشتن داشت) حذف شد. تغییرات=۰ یعنی «قبلاً دیده شده».
+        try{
+          const res=await this.db.prepare(
+            "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) "+
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at "+
+            "WHERE store.expires_at IS NULL OR store.expires_at<=? "+
+            "RETURNING value"
+          ).bind(k, tok, exp, Date.now()).first();
+          const mine=!!(res && String(res.value)===tok);
+          return mine ? {s:"claimed",t:tok} : {s:"seen"};
+        }catch(_eOldSqlite){
+          // مسیرِ پشتیبان (نسخه‌های قدیمی که DO UPDATE … WHERE / RETURNING ندارند)
+          const r1=await this.db.prepare(
             "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING"
-          ).bind(k, tok, Date.now()+(Number(ttlSec)||600)*1000).run();
-          changed=(res2&&res2.meta&&typeof res2.meta.changes==="number")
-            ? res2.meta.changes
-            : (res2&&typeof res2.changes==="number" ? res2.changes : null);
+          ).bind(k, tok, exp).run();
+          let changed=(r1&&r1.meta&&typeof r1.meta.changes==="number")
+            ? r1.meta.changes
+            : (r1&&typeof r1.changes==="number" ? r1.changes : null);
+          if(changed===0){
+            try{
+              await this.db.prepare("DELETE FROM store WHERE key=? AND expires_at IS NOT NULL AND expires_at<=?")
+                .bind(k, Date.now()).run();
+            }catch{}
+            const r2=await this.db.prepare(
+              "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING"
+            ).bind(k, tok, exp).run();
+            changed=(r2&&r2.meta&&typeof r2.meta.changes==="number")
+              ? r2.meta.changes
+              : (r2&&typeof r2.changes==="number" ? r2.changes : null);
+          }
+          if(changed!=null) return changed>0 ? {s:"claimed",t:tok} : {s:"seen"};
+          const row=await this.db.prepare("SELECT value FROM store WHERE key=?").bind(k).first();
+          // ⚠️ صرفِ وجود ردیف کافی نیست — فقط اگر مقدار token خودمان باشد مالِ ماست.
+          return (row && String(row.value)===tok) ? {s:"claimed",t:tok} : {s:"seen"};
         }
-        if(changed!=null) return changed>0 ? {s:"claimed",t:tok} : {s:"seen"};
-        const row=await this.db.prepare("SELECT value FROM store WHERE key=?").bind(k).first();
-        // ⚠️ صرفِ وجود ردیف کافی نیست — فقط اگر مقدار token خودمان باشد مالِ ماست.
-        return (row && String(row.value)===tok) ? {s:"claimed",t:tok} : {s:"seen"};
-      }catch(e){ console.error("claimUpdate d1", e&&e.message); return {s:"error"}; }
+      }catch(e){
+        console.error("claimUpdate d1", e&&e.message);
+        // f48: سهمیهٔ نوشتن تمام شده ⇒ «خطا»ی گذرا نیست؛ جدا اعلام می‌کنیم تا
+        //   مسیرِ وب‌هوک به‌جای ۵۰۳ (و بازارسالِ بی‌پایانِ تلگرام) به کاربر خبر بدهد.
+        if(isQuotaErr(e)) return {s:"quota"};
+        return {s:"error"};
+      }
     }
     // بدون D1: حداقل حافظهٔ ایزوله — همان نقشهٔ __updSeen منبع حقیقت است
     if(!globalThis.__updSeen) globalThis.__updSeen=new Map();
@@ -3299,6 +3352,19 @@ class Store {
     if(arr.length>=lim) return false;
 
     const k="rl:"+String(uid)+":"+win;
+    // f48 (کاهشِ نوشتن): شمارندهٔ سراسریِ D1 دیگر برای «هر» پیام نوشته نمی‌شود.
+    //   - پیام‌های عادی: فقط هر ۵ پیام یک‌بار (و اولینِ هر پنجره) نوشته می‌شود.
+    //   - نزدیکِ سقف (۸۰٪): هر ۲ پیام یک‌بار؛ و در یک پیامِ آخرِ سقف همیشه
+    //     دقیق (تا سقفِ مشترکِ ایزوله‌ها سخت‌گیرانه بماند).
+    //   سقفِ سختِ همان ایزوله (بالا) دست‌نخورده است، پس اسپمِ تکی همان‌جا رد می‌شود.
+    const _nearCap = arr.length >= Math.max(1, Math.floor(lim*0.8));
+    const _urgent  = arr.length >= lim-1;            // یک پیام مانده به سقف
+    const _sync = _urgent || (_nearCap ? (arr.length % 2 === 0) : (arr.length % 5 === 0));
+    if(this.db && !_sync){
+      arr.push(now);
+      globalThis.__rl.set(memKey, arr);
+      return true;
+    }
     if(this.db){
       try{
         await this.ready();
@@ -21487,6 +21553,11 @@ export default {
     const kv=env.XPanelBot||env.KV||env.kv;
     const db=env.DB||env.D1||env.xpanel_db||null;
     const store=new Store(kv, db);
+    // f48 (کاهشِ نوشتن): اسکنِ سنگینِ «هشدارِ ۸۰٪» فقط روی دورهای زوج اجرا
+    //   می‌شود (هر ۲ دقیقه). ارسالِ صندوقِ هشدارها همچنان هر دقیقه است، پس
+    //   پیام‌ها بی‌دلیل عقب نمی‌افتند؛ فقط «جمع‌آوری» نیم‌سریع‌تر می‌شود.
+    let _evenMinute=true;
+    try{ _evenMinute=(new Date(Number(event&&event.scheduledTime)||Date.now()).getUTCMinutes()%2)===0; }catch{}
     try{ await store.ready(); }catch{}
 
     if(!(await store.isInstalled())) return;
@@ -21500,7 +21571,9 @@ export default {
         //    کاملاً تازه است، پس پیام‌ها واقعاً به کاربر می‌رسند (قبلاً ته صف بود و
         //    با خطای «Too many subrequests» می‌سوخت و کاربر بی‌پیام می‌ماند).
         try{
-          const _ft=await store.acquireLock("cron:warn80_flush", 45);
+          // f48: صندوقِ خالی ⇒ نه قفلی گرفته می‌شود نه نوشتنی (۲ نوشتن/دقیقه صرفه)
+          let _outbox=[]; try{ _outbox=await warn80OutboxRead(store); }catch{ _outbox=[]; }
+          const _ft=(_outbox && _outbox.length) ? await store.acquireLock("cron:warn80_flush", 45) : null;
           if(_ft){
             try{
               const _fr=await warn80Flush(store, new Tg(token0), W80_FLUSH_MAX);
@@ -21529,7 +21602,15 @@ export default {
         //    می‌سوزانند و پردازش صفِ بعدی گرسنه می‌ماند. پس اول صف، بعد بقیه.
 
         // ۱) صف انتظار — مهم‌ترین؛ هر اجرا (با قفل)
-        const pendTok=await store.acquireLock("cron:pending_cfgs", 120);
+        // f48: صفِ خالی ⇒ قفل گرفته نمی‌شود (۲ نوشتن/دقیقه صرفه) و همان خواندن
+        //   برای اعلانِ «صفِ گیرکرده» هم استفاده می‌شود (بدونِ خواندنِ تکراری).
+        let _pendQ=[];
+        try{
+          const _rq=await store.get(KEYS.PENDING_CFGS);
+          _pendQ=_rq?(typeof _rq==="string"?JSON.parse(_rq):_rq):[];
+        }catch{ _pendQ=[]; }
+        if(!Array.isArray(_pendQ)) _pendQ=[];
+        const pendTok=_pendQ.length ? await store.acquireLock("cron:pending_cfgs", 120) : null;
         if(pendTok){
           try{ await bot0.processPendingPublicConfigs(); }
           catch(e){ console.error("pending public", e&&e.message); }
@@ -21539,8 +21620,7 @@ export default {
         // 🚨 اگر هنوز کسی در صف انتظار مانده (پنل مرده/پر)، ادمین را
         // مطلع کن — حداکثر هر ۳۰ دقیقه یک‌بار تا اسپم نشود.
         try{
-          const rawQ=await store.get(KEYS.PENDING_CFGS);
-          const q=rawQ?JSON.parse(rawQ):[];
+          const q=_pendQ;   // f48: همان خواندنِ بالای همین اجرا
           if(Array.isArray(q)&&q.length){
             if(!await store.cache("notif:pending_stuck")){
               await store.setCache("notif:pending_stuck", true, 1800);
@@ -22074,7 +22154,7 @@ export default {
         // دورِ بعدی هم قفلِ دور قبل را می‌دید و رد می‌شد؛ دو دور از هر سه
         // دور هشدار بلعیده می‌شد. TTL را به ۵۰ ثانیه کاهش دادیم (زیرتر از
         // فاصلهٔ کرون) تا فقط اجراهای واقعاً هم‌پوشان بلاک شوند.
-    const _w80tok48=await store.acquireLock("cron:warn80", 50);
+    const _w80tok48 = _evenMinute ? await store.acquireLock("cron:warn80", 50) : null;
     if(_w80tok48) try{
       const users=await store.getBotUsers();
       const plans=await store.getPlans();
@@ -23386,6 +23466,15 @@ export default {
             const _cl=await store.claimUpdate(update.update_id, 600);
             const _cs=_cl&&_cl.s;
             if(_cs==="seen") return new Response("OK",{status:200});
+            if(_cs==="quota"){
+              // f48: سهمیهٔ روزانهٔ نوشتنِ D1 تمام شده است. ۵۰۳ دادن یعنی تلگرام
+              //   همین آپدیت را بی‌پایان بازارسال کند (هر بار یک تلاشِ ناموفقِ
+              //   نوشتن و یک رباتِ کاملاً مرده). پس: یک‌بار (هر ۱۵ دقیقه) به
+              //   کاربر خبر می‌دهیم و ۲۰۰ برمی‌گردانیم. ۰۰:۰۰ UTC خودش درست می‌شود.
+              try{ globalThis.__updSeen.delete(uidKey); }catch{}
+              try{ await quotaNotice(store, token, update); }catch{}
+              return new Response("OK",{status:200});
+            }
             if(_cs==="error"){
               // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — High ۵): نشانگر حافظه هم
               //    پاک شود وگرنه retry تلگرام به همین ایزوله می‌رسد، میان‌بر
@@ -23444,9 +23533,13 @@ export default {
         //    «در حال ساخت کانفیگ...» + اجرای دوبارهٔ کارهای غیر-idempotent.
         //    حالا ۲۰۰ برمی‌گردد؛ کاربر در صف انتظار می‌ماند و کرون (بی‌صدا)
         //    ساخت را دوباره تلاش می‌کند و ادمین هم خبردار می‌شود.
-        const retriable =
+        // f48: پر شدنِ سهمیهٔ نوشتن، «گذرا» نیست — بازارسالِ تلگرام فقط حلقهٔ
+        //   شکست می‌سازد. یک‌بار به کاربر/مالک خبر می‌دهیم و ۲۰۰ می‌دهیم.
+        const _quotaErr=isQuotaErr(emsg);
+        if(_quotaErr){ try{ await quotaNotice(store, token, update); }catch{} }
+        const retriable = !_quotaErr && (
           /BOTUSERS_LOCK_TIMEOUT/i.test(emsg) ||
-          /D1_ERROR|Network connection lost|internal error/i.test(emsg);
+          /D1_ERROR|Network connection lost|internal error/i.test(emsg));
         console.error("webhook handler error:", emsg);
         try{
           await store.pushLog({
