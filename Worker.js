@@ -5678,6 +5678,9 @@ class Bot {
       if(!need && (d.startsWith("dci:")||d.startsWith("cdelete:"))) need="delete";
       if(!need && d.startsWith("bulk")) need="bulk";
       if(!need && d.startsWith("pm:")) need="panels";
+      // 🆕 f46: دکمه‌های کارتِ «افزودن پنل» (addc:*) هم مثل بقیهٔ کارهای پنل
+      //    مجوز «panels» می‌خواهند (سابقهٔ f10: ACL نباید از دست برود).
+      if(!need && d.startsWith("addc:")) need="panels";
       // 🔴 f10 (گزارش امنیتی ۱۸ سپتامبر — Critical ۲): فعال/غیرفعال‌سازی
       //    پنل هم مجوز «panels» می‌خواهد؛ قبلاً sel_en:/sel_dis: کلاً از
       //    ACL عبور می‌کردند.
